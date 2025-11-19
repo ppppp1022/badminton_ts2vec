@@ -1,0 +1,32 @@
+[
+  {
+    "experiment": "clear_global_total_kfold",
+    "fold_accuracies": 0.1922,
+    "error": 1.8707056303365424
+  },
+  {
+    "experiment": "clear_local_total_kfold",
+    "fold_accuracies": 0.2192,
+    "error": 1.6909652297251412
+  },
+  {
+    "experiment": "clear_global_arm_kfold",
+    "fold_accuracies": 0.2157,
+    "error": 1.9567641595482397
+  },
+  {
+    "experiment": "clear_local_arm_kfold",
+    "fold_accuracies": 0.2087,
+    "error": 1.9975726727912797
+  },
+  {
+    "experiment": "clear_global_leg_kfold",
+    "fold_accuracies": 0.14627661422231167,
+    "error": 2.1317896722241243
+  },
+  {
+    "experiment": "clear_local_leg_kfold",
+    "fold_accuracies": 0.1368227566053842,
+    "error": 1.9850940362656329
+  }
+]
