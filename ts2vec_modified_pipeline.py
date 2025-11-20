@@ -17,7 +17,10 @@ from sklearn.manifold import TSNE
 import seaborn as sns
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from ts2vec_skill_classification import SkillLevelClassifier, SkillLevelTrainer
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 
 def setup_dataset(processed_data_folder):
@@ -324,6 +327,131 @@ def visualize_embeddings(embeddings, labels, fold_idx, save_dir, suffix="Test"):
     plt.close() # 메모리 해제
     print(f"Saved: {save_path}")
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+
+class TS2VecNNClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes, hidden_dim=128, dropout=0.5, device='cuda'):
+        super().__init__()
+        self.device = device
+        
+        # --- 여기가 진짜 Neural Network (MLP) 구조입니다 ---
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),      # 입력 -> 은닉층
+            nn.BatchNorm1d(hidden_dim),            # 학습 안정화 (선택 사항)
+            nn.ReLU(),                             # 비선형 활성화 함수 (이게 있어야 NN입니다)
+            nn.Dropout(p=dropout),                 # 과적합 방지
+            nn.Linear(hidden_dim, num_classes)     # 은닉층 -> 최종 클래스 개수
+        ).to(device)
+        
+        # CrossEntropyLoss가 내부적으로 Softmax를 수행하고 정수 라벨과 비교합니다.
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.AdamW(self.parameters(), lr=0.001)
+
+    def _pool(self, x):
+        """(N, T, F) -> (N, F) Max Pooling"""
+        if x.ndim == 3:
+            x = torch.max(x, dim=1)[0]
+        return x
+
+    def fit(self, train_embeddings, train_labels, epochs=100, batch_size=64, lr=0.001):
+        self.train()
+        
+        # Optimizer LR 업데이트
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+            
+        # Numpy -> Tensor 변환
+        X_tensor = torch.from_numpy(train_embeddings).float().to(self.device)
+        y_tensor = torch.from_numpy(train_labels).long().to(self.device) # 라벨은 반드시 long(정수)이어야 함
+        
+        # Max Pooling으로 시계열 압축
+        X_tensor = self._pool(X_tensor)
+        
+        N = X_tensor.size(0)
+        loss_history = []
+        
+        print(f"=== Neural Network 학습 시작 (Epochs: {epochs}) ===")
+        
+        for epoch in range(epochs):
+            idx = torch.randperm(N)
+            X_shuffled = X_tensor[idx]
+            y_shuffled = y_tensor[idx]
+            
+            epoch_loss = 0
+            correct = 0
+            total = 0
+            
+            for i in range(0, N, batch_size):
+                X_batch = X_shuffled[i:i+batch_size]
+                y_batch = y_shuffled[i:i+batch_size]
+                
+                self.optimizer.zero_grad()
+                
+                # 1. 모델 예측 (Logits 출력: 실수형 값들)
+                outputs = self.classifier(X_batch)
+                
+                # 2. Loss 계산 (여기서 정수형 라벨과 비교하여 학습됨)
+                loss = self.criterion(outputs, y_batch)
+                loss.backward()
+                self.optimizer.step()
+                
+                epoch_loss += loss.item()
+                
+                # 3. 정확도 계산 (가장 높은 값을 가진 인덱스를 정답으로 선택)
+                _, predicted = torch.max(outputs.data, 1) # 여기서 정수형 예측값이 나옴
+                total += y_batch.size(0)
+                correct += (predicted == y_batch).sum().item()
+                
+            avg_loss = epoch_loss / (N / batch_size)
+            acc = 100 * correct / total
+            loss_history.append(avg_loss)
+            
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.4f} | Acc: {acc:.2f}%")
+                
+        print("=== 학습 완료 ===")
+
+    def evaluate(self, test_embeddings, test_labels, label_names=None):
+        self.eval()
+        X_tensor = torch.from_numpy(test_embeddings).float().to(self.device)
+        
+        # Max Pooling
+        X_tensor = self._pool(X_tensor)
+        
+        with torch.no_grad():
+            outputs = self.classifier(X_tensor)
+            # outputs는 [0.1, 0.8, 0.1] 같은 확률 분포와 유사한 값
+            # torch.max(..., 1)을 하면 가장 큰 값의 '인덱스(정수)'를 반환함 -> 이것이 분류 결과
+            _, predicted = torch.max(outputs.data, 1)
+            
+        y_pred = predicted.cpu().numpy()
+        y_true = test_labels
+        
+        acc = accuracy_score(y_true, y_pred)
+        print(f"\n>>> 최종 테스트 정확도: {acc:.4f} ({acc*100:.2f}%) <<<\n")
+        
+        print(">>> 상세 분류 리포트 <<<")
+        print(classification_report(y_true, y_pred, target_names=label_names, digits=4))
+        
+        cm = confusion_matrix(y_true, y_pred)
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
+        plt.title(f'Confusion Matrix (Acc: {acc*100:.2f}%)')
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        
+        if label_names:
+            plt.xticks(np.arange(len(label_names)) + 0.5, label_names, rotation=45)
+            plt.yticks(np.arange(len(label_names)) + 0.5, label_names, rotation=0)
+            
+        plt.show()
+        return acc, 
 
 def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch = 20, batch_size=16,
                          hidden_dim = 64, output_dim = 64, device='cuda', output_dir='./results'):
@@ -381,8 +509,8 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         model = TS2Vec(input_dims=input_dim, hidden_dims=hidden_dim, output_dims=output_dim, device=device)
         model.fit(train_data=train_data, n_epochs=epoch, batch_size=batch_size)
 
-        train_embeddings = model.encode(acceleration_data)
-        
+        train_embeddings = model.encode(train_data)
+        test_embeddings = model.encode(test_data)
 
         visualize_embeddings(
             train_embeddings, 
@@ -392,26 +520,12 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
             suffix="Train"
         )
 
-        skill_trainer = SkillLevelTrainer(
-            model,
-            SkillLevelClassifier(embedding_dim=hidden_dim, num_classes=7), # num_classes 명시 권장,
-            lr=0.001,
-            device=device
-        )
+        nn_classifier = TS2VecNNClassifier(input_dim=hidden_dim, num_classes=7, hidden_dim=128, device=device)
+        nn_classifier.fit(train_embeddings, train_labels, epochs=epoch)
 
-        test_embeddings = model.encode(test_data)
+        accuracy = nn_classifier.evaluate(test_embeddings, test_labels)
 
-        for e in range(epoch):
-            loss = skill_trainer.train_epoch(train_embeddings, train_labels, batch_size=batch_size)
-            if (e + 1) % 10 == 0:
-                print(f'  Epoch {e+1}/{epoch}, Classifier Loss: {loss:.4f}')
-        
-        print("\n[Step 3] Evaluating...")
-        results = skill_trainer.evaluate(test_embeddings, test_labels)
-        print(f"Fold {fold_idx+1} Accuracy: {results['accuracy']:.4f}")
-
-        logs.append(results['report'])
-        accumulated_accuracy.append(results['accuracy'])
+        accumulated_accuracy.append(accuracy)
     
     average_accuracy = sum(accumulated_accuracy) / k
     
