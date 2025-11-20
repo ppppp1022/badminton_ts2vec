@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from preprocess_badminton_data import load_skill_levels_from_annotation
 from processed_data_loader import ProcessedBadmintonDataset
@@ -57,141 +57,212 @@ def setup_dataset(processed_data_folder):
     
     return dataset
 
-class LSTMClassification(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
-        super().__init__()
+class LSTMClassifier(nn.Module):
+    def __init__(self, input_size, hidden_size, num_classes, num_layers=2):
+        super(LSTMClassifier, self).__init__()
+        
+        # batch_first=True 필수
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         
-        
+        # 마지막 타임스텝의 결과를 분류
         self.fc = nn.Linear(hidden_size, num_classes)
-
+        
     def forward(self, x):
+        # x: (Batch, Time, 63)
         output, (hn, cn) = self.lstm(x)
-        # 마지막 시점의 정보를 이용해 클래스 확률(점수) 계산
-        scores = self.fc(hn[-1]) 
-        return scores
+        
+        # output[:, -1, :] : (Batch, Time, Hidden) 중 마지막 Time의 Hidden만 가져옴
+        # "스윙이 다 끝난 뒤의 요약 정보"를 사용
+        out = output[:, -1, :] 
+        
+        return self.fc(out)
 
-def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, lstm_epoch=100, device='cuda', 
-                        hidden_size=256, num_layers=3, batch_first=True):
+def pad_collate_fn(batch):
+    # batch = [(x1, y1), (x2, y2), ...]
+    inputs, labels = zip(*batch)
+    
+    # 패딩 적용 (길이가 짧은 스윙 뒤에 0을 채움)
+    # batch_first=True -> (Batch, Time, Feature)
+    inputs_padded = nn.utils.rnn.pad_sequence(inputs, batch_first=True, padding_value=0)
+    
+    # 라벨 합치기
+    labels = torch.tensor(labels, dtype=torch.long)
+    
+    return inputs_padded, labels
+
+class BadmintonDataset(Dataset):
+    def __init__(self, data_list, labels):
+        self.data = data_list
+        self.labels = labels
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        # 데이터: (Time, 63) 형태라고 가정
+        x = torch.tensor(self.data[idx], dtype=torch.float32)
+        y = torch.tensor(self.labels[idx], dtype=torch.long)
+        return x, y
+
+def collate_fn_with_labels(batch):
+    
+    padded = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=0)
+    print(batch)
+    
+    return padded
+
+def train_lstm_fold(train_data, train_labels, test_data, test_labels, input_size=63, num_classes=4, device='cuda'):
+    
+    # --- 하이퍼파라미터 설정 ---
+    BATCH_SIZE = 64
+    HIDDEN_SIZE = 128
+    NUM_LAYERS = 2
+    LEARNING_RATE = 0.001
+    EPOCHS = 100  # 적절히 조절하세요
+
+    # 1. DataLoader 생성
+    train_dataset = BadmintonDataset(train_data, train_labels)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate_fn)
+    
+    test_dataset = BadmintonDataset(test_data, test_labels)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=pad_collate_fn)
+
+    # 2. 모델 초기화
+    model = LSTMClassifier(input_size, HIDDEN_SIZE, num_classes, NUM_LAYERS).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # 3. 학습 루프
+    print(f"Start Training (Train: {len(train_data)}, Test: {len(test_data)})")
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        running_loss = 0.0
+        
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            
+        # 10 에폭마다 로그 출력
+        if (epoch + 1) % 10 == 0:
+            avg_loss = running_loss / len(train_loader)
+            print(f"Epoch [{epoch+1}/{EPOCHS}] Loss: {avg_loss:.4f}")
+
+    # 4. 최종 평가 (Test Set)
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs.data, 1)
+            
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    acc = 100 * correct / total
+    print(f"Fold Final Accuracy: {acc:.2f}%")
+    print("-" * 30)
+    
+    return acc
+
+def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, device='cuda', output_dir='./results'):
+    import numpy as np
+
+    def inspect_labels(name, labels):
+        # 리스트일 수도 있고 텐서일 수도 있으니 안전하게 변환
+        if hasattr(labels, 'cpu'): # 텐서라면
+            arr = labels.cpu().numpy()
+        else: # 리스트나 넘파이라면
+            arr = np.array(labels)
+            
+        # 혹시 차원이 (N, 1) 처럼 되어있을까봐 1차원으로 쫙 폄
+        arr = arr.flatten()
+        
+        unique_vals = np.unique(arr)
+        
+        print(f"=== [{name}] 분석 결과 ===")
+        print(f"1. 데이터 개수: {len(arr)}")
+        print(f"2. 고유값(종류): {unique_vals}")
+        print(f"3. 최소값: {np.min(arr)}")
+        print(f"4. 최대값: {np.max(arr)}")
+        print(f"5. 클래스 개수 추정: {len(unique_vals)}")
+        print("-" * 30)
     """
     K-Fold 교차 검증 실험 실행
     """
-    
-    # 데이터셋에서 subject 분할
-    folds, labels = dataset.split_data_Kfold(stroke_type, k)
+    os.makedirs(output_dir, exist_ok=True)
+
+    folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
     accumulated_accuracy = []
-    mean_errors = []
-    
+
     for fold_idx in range(k):
         print(f"\n=== Fold {fold_idx+1}/{k} Start ===")
         
         # Fold에 따른 Subject 리스트 생성
-        train_subjects = [s for i, fold in enumerate(folds) if i != fold_idx for s in fold]
-        test_subjects = folds[fold_idx]
-
-        # --- Train Data Loading ---
-        train_sequences = [] 
-        train_labels_list = [] # 변수명 명확히
-        
-        for subject in train_subjects:
-            strokes, skill = dataset.load_subject_data(subject, stroke_type, joint_type, body_part)
-            for single_stroke in strokes:
-                seq_tensor = torch.tensor(single_stroke, dtype=torch.float32)
-                train_sequences.append(seq_tensor)
-                
-                # [중요] Skill 1~7 -> Label 0~6 변환
-                train_labels_list.append(skill - 1) 
-        
-        # --- Test Data Loading ---
-        print("Loading test data...")
-        test_sequences = []
-        test_labels_list = []
-
-        for subject in test_subjects:
-            strokes, skill = dataset.load_subject_data(subject, stroke_type, joint_type, body_part)
-            for single_stroke in strokes:
-                seq_tensor = torch.tensor(single_stroke, dtype=torch.float32)
-                test_sequences.append(seq_tensor)
-                test_labels_list.append(skill - 1) # 여기도 똑같이 -1
-
-        input_size = train_sequences[0].shape[1]
-        print(f"Input size: {input_size}, Train samples: {len(train_sequences)}, Test samples: {len(test_sequences)}")
-        
-        # --- Tensor 변환 & Padding ---
-        train_data_tensor = pad_sequence(train_sequences, batch_first=True, padding_value=0)
-        train_label_tensor = torch.tensor(train_labels_list, dtype=torch.long)
-        
-        test_data_tensor = pad_sequence(test_sequences, batch_first=True, padding_value=0)
-        test_label_tensor = torch.tensor(test_labels_list, dtype=torch.long)
+        train_data = [stroke for i, fold in enumerate(folds) if i != fold_idx for stroke in fold]
+        test_data = folds[fold_idx]
+        train_labels =[l-1 for i, label in enumerate(labels) if i != fold_idx for l in label]
+        test_labels = [l-1 for i, label in enumerate(labels) if i == fold_idx for l in label]
+        sample_data = train_data[0]
+        input_size = len(sample_data[0])
+        print(f"Input size: {input_size}, Train samples: {len(train_data)}, Test samples: {len(test_data)}")
         
         # DataLoader 생성
-        train_dataset = TensorDataset(train_data_tensor, train_label_tensor)
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        NUM_CLASSES = 7
 
-        # [수정 1] 모델 정의: num_classes=7 (1~7단계를 분류하므로)
-        # [수정 2] .to(device) 추가: 모델을 GPU로 이동
-        model = LSTMClassification(input_size=input_size, hidden_size=hidden_size, 
-                                   num_layers=num_layers, num_classes=7).to(device)
-        
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        # 디바이스 설정
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # --- 학습 루프 ---
-        print("Training lstm...")
-        model.train()
-
-        for epoch in range(lstm_epoch):
-            epoch_loss = 0.0
-            
-            for inputs, labels in train_loader:
-                # [수정 3] 데이터도 GPU로 이동해야 함
-                inputs, labels = inputs.to(device), labels.to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-                
-                epoch_loss += loss.item()
-
-            if (epoch+1) % 10 == 0:
-                avg_loss = epoch_loss / len(train_loader)
-                print(f"Epoch [{epoch+1}/{lstm_epoch}], Avg Loss: {avg_loss:.4f}")
-
-        # --- 평가 루프 ---
-        print("Evaluating model...")
-        
-        # [수정 4] Test 데이터 GPU 이동 및 변수명 통일 (test_label_tensor)
-        test_data_tensor = test_data_tensor.to(device)
-        test_label_tensor = test_label_tensor.to(device)
-        
-        model.eval()
-        with torch.no_grad():
-            test_outputs = model(test_data_tensor)
-            predicted_classes = torch.argmax(test_outputs, dim=1)
-            
-            # [수정 5] 정확도 계산 시 변수명 오타 수정
-            correct_tensor = (predicted_classes == test_label_tensor)
-            mean_errors.append(np.mean(abs(avg_pred - subject_true) for subject_true, avg_pred in zip(test_label_tensor.cpu().numpy(), predicted_classes.cpu().numpy())))
-            correct_count = correct_tensor.sum().item()
-            total_count = test_label_tensor.size(0)
-
-            accuracy = correct_count / total_count
-            print(f"Fold {fold_idx+1} Accuracy: {accuracy:.4f}")
-        mean_errors = np.mean(mean_errors)
+        # 함수 호출!
+        accuracy = train_lstm_fold(
+            train_data, 
+            train_labels, 
+            test_data, 
+            test_labels, 
+            input_size=input_size,       # 로그에 찍힌 63
+            num_classes=NUM_CLASSES, 
+            device=device
+        )
         accumulated_accuracy.append(accuracy)
 
-    average_accuracy = sum(accumulated_accuracy) / k
+    average_accuracy = np.mean(accumulated_accuracy)
     print(f"\nAverage Accuracy over {k} folds: {average_accuracy:.4f}")
 
     result_summary = {
         'experiment': f"{stroke_type}_{joint_type}_{body_part}_kfold",
         'fold_accuracies': accumulated_accuracy,
-        'average_accuracy': average_accuracy,
-        'error': mean_errors
+        'average_accuracy': average_accuracy
     }
+    summary_file_path = os.path.join(output_dir, 'all_results_summary.json')
+    
+    existing_data = []
+    if os.path.exists(summary_file_path):
+        with open(summary_file_path, 'r', encoding='utf-8') as f:
+            try:
+                existing_data = json.load(f)
+                if not isinstance(existing_data, list):
+                    existing_data = [existing_data]
+            except json.JSONDecodeError:
+                existing_data = []
+                
+    existing_data.append(result_summary)
+
+    with open(summary_file_path, 'w', encoding='utf-8') as f:
+        json.dump(existing_data, f, indent=2, ensure_ascii=False)
+
+    print(f"All results saved to {summary_file_path}")
     return result_summary
+
 def main():
     processed_data_folder = './Processed_Data'
     output_dir = './results_lstm'
@@ -206,28 +277,24 @@ def main():
     experiments = [
         # Clear - 전체
         ('clear', 'global', 'total'),
-        ('clear', 'local', 'total'),
+        #('clear', 'local', 'total'),
         
         # Clear - 부위별
-        ('clear', 'global', 'arm'),
-        ('clear', 'local', 'arm'),
-        ('clear', 'global', 'leg'),
-        ('clear', 'local', 'leg'),
+        #('clear', 'global', 'arm'),
+        #('clear', 'local', 'arm'),
+        #('clear', 'global', 'leg'),
+        #('clear', 'local', 'leg'),
         
         # Drive - 전체
-        ('drive', 'global', 'total'),
-        ('drive', 'local', 'total'),
+        #('drive', 'global', 'total'),
+        #('drive', 'local', 'total'),
         
         # Drive - 부위별
-        ('drive', 'global', 'arm'),
-        ('drive', 'local', 'arm'),
-        ('drive', 'global', 'leg'),
-        ('drive', 'local', 'leg'),
+        #('drive', 'global', 'arm'),
+        #('drive', 'local', 'arm'),
+        #('drive', 'global', 'leg'),
+        #('drive', 'local', 'leg'),
     ]
-    """experiments = [
-            # Clear - 전체
-            ('clear', 'local', 'total')
-    ]"""
     # 각 실험 실행
     all_results = []
     for stroke_type, joint_type, body_part in experiments:
@@ -238,10 +305,7 @@ def main():
                 joint_type,
                 body_part,
                 device=device,
-                lstm_epoch=100,
-                hidden_size=256,
-                num_layers=3,
-                batch_first=True
+                output_dir=output_dir
             )
             if result:
                 all_results.append(result)
@@ -250,10 +314,6 @@ def main():
             import traceback
             traceback.print_exc()
         
-    # 전체 결과 저장
-    with open(os.path.join(output_dir, 'all_results_summary.json'), 'w') as f:
-        json.dump(all_results, f, indent=2)
-    
     print(f"\nAll results saved to {output_dir}")
 
 

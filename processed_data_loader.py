@@ -2,6 +2,7 @@ import numpy as np
 import os
 from typing import List, Tuple
 import random
+import torch
 
 class ProcessedBadmintonDataset:
     """전처리된 배드민턴 데이터셋 로더 (너의 파일구조에 맞게 수정됨)"""
@@ -30,8 +31,6 @@ class ProcessedBadmintonDataset:
                           joint_type: str, body_part: str) -> Tuple[List[np.ndarray], float]:
         """
         너의 디렉토리 구조:
-        Processed_Data/S00/S00_clear/local.npy
-        Processed_Data/S00/S00_clear/global.npy
         """
         
         # 예: S00_clear
@@ -121,6 +120,36 @@ class ProcessedBadmintonDataset:
             fold_labels = [skill_list[int(s[1:])] for s in fold]
             labels.append(fold_labels)
         return folds, labels
+    
+    def split_data_Kfold_randomly(self, stroke_type: str, joint_type: str, body_part: List, k: int = 5):
+        """K-fold, 통합 후 랜덤하게 분리"""
+        folds = []
+        all_strokes = []
+        labels = []
+        subjects = self.beginner_subjects + self.intermediate_subjects + self.expert_subjects
+        
+        for subj in subjects:
+            strokes, skills = self.load_subject_data(subj, stroke_type, joint_type, body_part)
+            all_strokes.extend(strokes)
+            labels.extend([skills] * len(strokes))
+        
+        indices = torch.randperm(len(all_strokes)).tolist()
+        all_strokes = [all_strokes[i] for i in indices]
+        labels = [labels[i] for i in indices]
+
+        n_samples = len(all_strokes)
+        folds_strokes = []
+        folds_labels = []
+
+        for i in range(k):
+            start_idx = (n_samples * i) // k
+            end_idx = (n_samples * (i + 1)) // k
+            # 데이터 슬라이싱하여 저장
+            # all_strokes[start:end] -> [stroke_A, stroke_B, ...] 형태
+            folds_strokes.append(all_strokes[start_idx:end_idx])
+            folds_labels.append(labels[start_idx:end_idx])
+
+        return folds_strokes, folds_labels
 
     def get_statistics(self):
         """데이터셋 통계 출력 (너의 파일 형식에 맞게 수정됨)"""

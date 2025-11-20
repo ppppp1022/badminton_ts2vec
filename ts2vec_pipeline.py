@@ -19,8 +19,9 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import seaborn as sns
 import pandas as pd
+from torch.utils.data import Dataset, DataLoader
 from ts2vec_skill_classification import (
-    TS2Vec, TS2VecTrainer, SkillLevelClassifier, SkillLevelTrainer
+    TS2Vec, SkillLevelClassifier, SkillLevelTrainer, ImprovedTS2VecTrainer, StrokeDataset, collate_fn_with_labels
 )
 # TS2Vec 관련 import는 기존 artifact에서 가져온다고 가정
 
@@ -105,181 +106,6 @@ def augment_dataset(data_list, labels_list, num_augments=1):
             
     return augmented_data, augmented_labels
 
-def run_experiment(dataset, stroke_type, joint_type, body_part, device='cuda', 
-                   ts2vec_epochs=100, classifier_epochs=50, output_dir='./results'):
-    """
-    하나의 실험 실행 (특정 stroke_type, joint_type, body_part 조합)
-    
-    Args:
-        dataset: ProcessedBadmintonDataset 객체
-        stroke_type: 'clear' or 'drive'
-        joint_type: 'local' or 'global'
-        body_part: 'arm', 'leg', 'total'
-        device: 'cuda' or 'cpu'
-        ts2vec_epochs: TS2Vec 학습 에폭 수
-        classifier_epochs: Classifier 학습 에폭 수
-        output_dir: 결과 저장 폴더
-    """
-    from ts2vec_skill_classification import (
-        TS2Vec, TS2VecTrainer, SkillLevelClassifier, SkillLevelTrainer
-    )
-    
-    print(f"Experiment: {stroke_type} - {joint_type} - {body_part}")
-    
-    # 1. 데이터 분할
-    train_subjects, test_subjects, train_labels, test_labels = dataset.split_data_by_skill(stroke_type)
-    
-    print(f"\nTrain subjects ({len(train_subjects)}): {train_subjects}")
-    print(f"Train labels (float): {[f'{l:.2f}' for l in train_labels]}")
-    print(f"\nTest subjects ({len(test_subjects)}): {test_subjects}")
-    print(f"Test labels (float): {[f'{l:.2f}' for l in test_labels]}")
-    
-    # 2. 데이터 로드
-    print("\nLoading training data...")
-    train_data_list = []
-    for subject in train_subjects:
-        try:
-            strokes, skill = dataset.load_subject_data(subject, stroke_type, joint_type, body_part)
-            train_data_list.append(strokes)
-            #print(f"  {subject}: {len(strokes)} strokes, skill={skill:.2f}")
-        except Exception as e:
-            print(f"  {subject}: Error - {e}")
-    
-    print("\nLoading test data...")
-    test_data_list = []
-    for subject in test_subjects:
-        try:
-            strokes, skill = dataset.load_subject_data(subject, stroke_type, joint_type, body_part)
-            test_data_list.append(strokes)
-            #print(f"  {subject}: {len(strokes)} strokes, skill={skill:.2f}")
-        except Exception as e:
-            print(f"  {subject}: Error - {e}")
-    
-    if len(train_data_list) == 0 or len(test_data_list) == 0:
-        print("ERROR: No data loaded. Skipping this experiment.")
-        return None
-    
-    # 3. Input dimension 계산
-    sample_data = train_data_list[0][0]
-    input_dim = sample_data.shape[1]
-    print(f"\nInput dimension: {input_dim}")
-    
-    # 4. TS2Vec 학습
-    print("\n" + "="*60)
-    print("Training TS2Vec")
-    print("="*60)
-    
-    ts2vec_model = TS2Vec(input_dim=input_dim, hidden_dim= 256, output_dim=256)
-    ts2vec_trainer = TS2VecTrainer(ts2vec_model, lr=0.001, device=device)
-    #print(f"train data list shape: {type(train_data_list)}\n")
-    for epoch in range(ts2vec_epochs):
-        loss = ts2vec_trainer.train_epoch(train_data_list, batch_size=32)
-        if (epoch + 1) % 10 == 0:
-            print(f'Epoch {epoch+1}/{ts2vec_epochs}, Loss: {loss:.4f}')
-    
-    print("\n Saving TS2Vec Model")
-    model_path = ts2vec_trainer.save_model(stroke_type, joint_type)
-    print(f"TS2Vec model saved to {model_path}")
-    # 5. 임베딩 추출
-    print("Extracting Embeddings")
-    
-    skill_trainer = SkillLevelTrainer(
-        ts2vec_model,
-        SkillLevelClassifier(embedding_dim=128),
-        lr=0.001,
-        device=device
-    )
-    
-    train_embeddings = skill_trainer.extract_embeddings(train_data_list)
-    test_embeddings = skill_trainer.extract_embeddings(test_data_list)
-    
-    # Label 확장
-    train_labels_expanded = []
-    for i, data in enumerate(train_data_list):
-        train_labels_expanded.extend([train_labels[i]] * len(data))
-    train_labels_expanded = np.array(train_labels_expanded, dtype=np.float32)
-    
-    test_labels_expanded = []
-    for i, data in enumerate(test_data_list):
-        test_labels_expanded.extend([test_labels[i]] * len(data))
-    test_labels_expanded = np.array(test_labels_expanded, dtype=np.float32)
-    
-    print(f"Train embeddings: {train_embeddings.shape}")
-    print(f"Test embeddings: {test_embeddings.shape}")
-    print(f"Train labels range: {train_labels_expanded.min():.2f} - {train_labels_expanded.max():.2f}")
-    
-    # 6. Skill Level Regressor 학습
-    print("Training Skill Level Regressor")
-    
-    for epoch in range(classifier_epochs):
-        loss = skill_trainer.train_epoch(train_embeddings, train_labels_expanded, batch_size=64)
-        if (epoch + 1) % 10 == 0:
-            print(f'Epoch {epoch+1}/{classifier_epochs}, MSE Loss: {loss:.4f}')
-    
-    # 7. 평가
-    print("Evaluation")
-    
-    results = skill_trainer.evaluate(test_embeddings, test_labels_expanded)
-    
-    print(f"Accuracy (rounded): {results['accuracy']:.4f}")
-    print(f"\npredictions: {results['predictions']}")
-    print(f"rmse:{results['rmse']:.4f}")
-    print(results['report'])
-    print("\nConfusion Matrix (rounded predictions):")
-    print(results['confusion_matrix'])
-    
-    # 8. 피험자별 평가
-    print("Per-Subject Evaluation")
-    
-    subject_results = []
-    start_idx = 0
-    for i, (subject, data) in enumerate(zip(test_subjects, test_data_list)):
-        end_idx = start_idx + len(data)
-        subject_preds = results['predictions'][start_idx:end_idx]
-        subject_true = test_labels[i]
-        
-        avg_pred = subject_preds.mean()
-        rounded_pred = round(avg_pred)
-        error = abs(avg_pred - subject_true)
-        
-        subject_result = {
-            'subject': subject,
-            'true': subject_true,
-            'predicted': avg_pred,
-            'rounded': rounded_pred,
-            'error': error
-        }
-        subject_results.append(subject_result)
-        
-        print(f"{subject}: True={subject_true:.2f}, Predicted={avg_pred:.2f} "
-              f"(rounded: {rounded_pred}), Error={error:.2f}")
-        
-        start_idx = end_idx
-    
-    # 9. 결과 저장
-    os.makedirs(output_dir, exist_ok=True)
-    
-    result_summary = {
-        'experiment': f"{stroke_type}_{joint_type}_{body_part}",
-        'train_subjects': train_subjects,
-        'test_subjects': test_subjects,
-        'metrics': {
-            'prediction': results['predictions'].tolist(),
-            'accuracy': float(results['accuracy']),
-            'rmse': float(results['rmse'])
-        },
-        'confusion_matrix': results['confusion_matrix'].tolist(),
-        'subject_results': subject_results
-    }
-    
-    result_filename = f"{stroke_type}_{joint_type}_{body_part}_results.json"
-    with open(os.path.join(output_dir, result_filename), 'w') as f:
-        json.dump(result_summary, f, indent=2)
-    
-    print(f"\nResults saved to {os.path.join(output_dir, result_filename)}")
-    
-    return result_summary
-
 def visualize_embeddings(embeddings, labels, fold_idx, save_dir, suffix="Test"):
     """
     T-SNE 시각화 및 저장
@@ -347,139 +173,100 @@ def visualize_embeddings(embeddings, labels, fold_idx, save_dir, suffix="Test"):
 
 def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, device='cuda', 
                           ts2vec_epochs=100, classifier_epochs=50, output_dir='./results'):
+    def inspect_labels(name, labels):
+        # 리스트일 수도 있고 텐서일 수도 있으니 안전하게 변환
+        if hasattr(labels, 'cpu'): # 텐서라면
+            arr = labels.cpu().numpy()
+        else: # 리스트나 넘파이라면
+            arr = np.array(labels)
+            
+        # 혹시 차원이 (N, 1) 처럼 되어있을까봐 1차원으로 쫙 폄
+        arr = arr.flatten()
+        
+        unique_vals = np.unique(arr)
+        
+        print(f"=== [{name}] 분석 결과 ===")
+        print(f"1. 데이터 개수: {len(arr)}")
+        print(f"2. 고유값(종류): {unique_vals}")
+        print(f"3. 최소값: {np.min(arr)}")
+        print(f"4. 최대값: {np.max(arr)}")
+        print(f"5. 클래스 개수 추정: {len(unique_vals)}")
+        print("-" * 30)
     """
     K-Fold 교차 검증 실험 실행 (T-SNE 포함)
     """
-    def normalize_data(data_list, method='standard'):
-        """
-        데이터 정규화 함수 (Step 2)
-        Args:
-            data_list: List of np.array (각 array는 [Time, Features])
-            method: 'standard' (평균0, 표준편차1) or 'minmax' (0~1)
-        Returns:
-            normalized_list: 정규화된 데이터 리스트
-        """
-        normalized_list = []
-        
-        for stroke in data_list:
-            # stroke shape: (Time, Features)
-            
-            if method == 'standard':
-                # [추천] Standard Scaling (Z-score)
-                # 각 Feature별로 시간축(Time)에 대한 평균/표준편차 계산
-                mean = np.mean(stroke, axis=0)
-                std = np.std(stroke, axis=0)
-                
-                # 분모 0 방지 (매우 중요!)
-                std = np.where(std == 0, 1e-6, std)
-                
-                norm_stroke = (stroke - mean) / std
-                
-            elif method == 'minmax':
-                # Min-Max Scaling (-1 ~ 1 또는 0 ~ 1)
-                min_val = np.min(stroke, axis=0)
-                max_val = np.max(stroke, axis=0)
-                
-                denom = max_val - min_val
-                denom = np.where(denom == 0, 1e-6, denom)
-                
-                # -1 ~ 1 로 변환 (Global 좌표에 적합)
-                norm_stroke = 2 * (stroke - min_val) / denom - 1
-                
-            normalized_list.append(norm_stroke)
-            
-        return normalized_list
-    # 필요한 클래스들이 이미 import 되어 있다고 가정합니다.
-    # from models import TS2Vec, TS2VecTrainer, SkillLevelClassifier, SkillLevelTrainer
     
-    # 결과 저장용 폴더 생성
     os.makedirs(output_dir, exist_ok=True)
     
-    # 2. [추가] 이미지 저장용 하위 폴더 생성
     tsne_save_dir = os.path.join(output_dir, 'tsne_images')
     os.makedirs(tsne_save_dir, exist_ok=True)
 
-    folds, labels = dataset.split_data_Kfold(stroke_type, k)
+    folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
     accumulated_accuracy = []
-    mean_errors = []
-    
+    logs = []
+
     print(f"Starting experiment: {stroke_type}_{joint_type}_{body_part}")
 
     for fold_idx in range(k):
         print(f"\n{'='*20}\n Fold {fold_idx+1} / {k} \n{'='*20}")
         
         # --- 1. 데이터 준비 ---
-        train_subjects = [s for i, fold in enumerate(folds) if i != fold_idx for s in fold]
-        test_subjects = folds[fold_idx]
-        train_labels = [l for i, label in enumerate(labels) if i != fold_idx for l in label]
+        train_data = [stroke for i, fold in enumerate(folds) if i != fold_idx for stroke in fold]
+        test_data = folds[fold_idx]
+        train_labels =[l for i, label in enumerate(labels) if i != fold_idx for l in label]
         test_labels = labels[fold_idx]
 
-        train_data_list = []
-        for subject in train_subjects:
-            strokes, skill = dataset.load_subject_data(subject, stroke_type, joint_type, body_part)
-            train_data_list.append(strokes)
-        
-        test_data_list = []
-        for subject in test_subjects:
-            strokes, skill = dataset.load_subject_data(subject, stroke_type, joint_type, body_part)
-            test_data_list.append(strokes)
-        
-
-        print(f"===Data Augumentation===")
-        train_data_list, train_labels = augment_dataset(
-            train_data_list, 
-            train_labels, 
-            num_augments=2 
-        )
-
-        print(f"{len(train_data_list)}")
-        print(f"===Normalization===")
-        train_data_list = normalize_data(train_data_list, method='standard')
-        test_data_list = normalize_data(test_data_list, method='standard')
-
         # Input Dimension 확인
-        sample_data = train_data_list[0]
-        input_dim = sample_data.shape[2]  
+        sample_data = train_data[0]
+        input_dim = len(sample_data[0]) 
         print(f"Input dimension: {input_dim}")
         # --- 2. TS2Vec 학습 (Unsupervised) ---
-        print("\n[Step 1] Training TS2Vec (Self-Supervised)...")
+        print(f"\n[Step 1] Training TS2Vec (Self-Supervised)...{len(train_data)}")
         
         # hidden_dim=128로 설정 (Classifier 입력과 맞춤)
-        ts2vec_model = TS2Vec(input_dim=input_dim, hidden_dim=64, output_dim=256)
-        ts2vec_trainer = TS2VecTrainer(ts2vec_model, lr=0.001, device=device)
+        ts2vec_model = TS2Vec(input_dim=input_dim, hidden_dim=128, depth=15,output_dim=128)
+        ts2vec_trainer = ImprovedTS2VecTrainer(ts2vec_model, lr=0.001, device=device)
         
+        batch_size = 64
+
+        print("\nMaking DataLoader")
+        dataset = StrokeDataset(train_data)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+            collate_fn=collate_fn_with_labels  # 라벨 없는 버전 사용
+        )
+        print("\nStart Epoch")
+        ts2vec_trainer.model.train()
         for epoch in range(ts2vec_epochs):
-            loss = ts2vec_trainer.train_epoch(train_data_list, batch_size=128)
+            loss = ts2vec_trainer.train_epoch(dataloader)  # 배치 증가
             if (epoch + 1) % 10 == 0:
                 print(f'  Epoch {epoch+1}/{ts2vec_epochs}, Loss: {loss:.4f}')
-        
+
+
         # --- 3. 임베딩 추출 및 분류기 학습 ---
         print("\n[Step 2] Extracting Embeddings & Training Classifier...")
         
         # output_dim=128은 TS2Vec의 hidden_dim과 일치해야 함
         skill_trainer = SkillLevelTrainer(
             ts2vec_model,
-            SkillLevelClassifier(embedding_dim=64, num_classes=7), # num_classes 명시 권장
+            SkillLevelClassifier(embedding_dim=128, num_classes=7), # num_classes 명시 권장,
             lr=0.001,
             device=device
         )
+
         
         # 임베딩 추출 (배치 처리된 개선 버전 사용 권장)
-        train_embeddings = skill_trainer.extract_embeddings(train_data_list)
-        test_embeddings = skill_trainer.extract_embeddings(test_data_list)
+        train_embeddings = skill_trainer.extract_embeddings(train_data)
+        test_embeddings = skill_trainer.extract_embeddings(test_data)
 
-        # 라벨 확장 (Subject 단위 -> Stroke 단위)
-        train_labels_expanded = []
-        for i, data in enumerate(train_data_list):
-            train_labels_expanded.extend([train_labels[i]] * len(data))
-        train_labels_expanded = np.array(train_labels_expanded, dtype=np.float32) # or int
+        train_labels_expanded = np.array(train_labels, dtype=np.float32)
+        test_labels_expanded = np.array(test_labels, dtype=np.float32)
         
-        test_labels_expanded = []
-        for i, data in enumerate(test_data_list):
-            test_labels_expanded.extend([test_labels[i]] * len(data))
-        test_labels_expanded = np.array(test_labels_expanded, dtype=np.float32)
         print("\n[Visualization] Generating T-SNE plots...")
-        
         # 1. Train Data 시각화
         visualize_embeddings(
             train_embeddings, 
@@ -500,7 +287,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, devic
 
         # 분류기 학습
         for epoch in range(classifier_epochs):
-            loss = skill_trainer.train_epoch(train_embeddings, train_labels_expanded, batch_size=64)
+            loss = skill_trainer.train_epoch(train_embeddings, train_labels_expanded, batch_size=32)
             if (epoch + 1) % 10 == 0:
                 print(f'  Epoch {epoch+1}/{classifier_epochs}, Classifier Loss: {loss:.4f}')
 
@@ -508,57 +295,22 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, devic
         print("\n[Step 3] Evaluating...")
         results = skill_trainer.evaluate(test_embeddings, test_labels_expanded)
         print(f"Fold {fold_idx+1} Accuracy: {results['accuracy']:.4f}")
-        
-        # --- 5. Subject 단위 결과 집계 ---
-        print("\n[Per-Subject Analysis]")
-        subject_results = []
-        start_idx = 0
-        
-        for i, (subject, data) in enumerate(zip(test_subjects, test_data_list)):
-            end_idx = start_idx + len(data)
-            
-            # 해당 Subject의 예측값들 슬라이싱
-            subject_preds = results['predictions'][start_idx:end_idx]
-            subject_true = test_labels[i]
-            
-            # 평균 예측값 계산
-            avg_pred = subject_preds.mean()
-            rounded_pred = round(avg_pred)
-            error = abs(avg_pred - subject_true)
-            
-            subject_results.append({
-                'subject': subject,
-                'true': subject_true,
-                'predicted': avg_pred,
-                'rounded': rounded_pred,
-                'error': error
-            })
-            
-            print(f"  Subject {subject}: True={subject_true}, Pred={avg_pred:.2f} "
-                  f"(Round: {rounded_pred}), Error={error:.2f}")
-            
-            start_idx = end_idx
-
-        # Fold별 평균 에러 저장
-        fold_mean_error = np.mean([res['error'] for res in subject_results])
-        mean_errors.append(fold_mean_error)
+        logs.append(results['report'])
         accumulated_accuracy.append(results['accuracy'])
 
     # --- 6. 전체 결과 요약 및 저장 ---
-    final_mean_error = np.mean(mean_errors)
     average_accuracy = sum(accumulated_accuracy) / k
     
     print(f"\n{'='*30}")
     print(f"Final Result ({k}-Fold CV)")
     print(f"Avg Accuracy: {average_accuracy:.4f}")
-    print(f"Avg Error: {final_mean_error:.4f}")
     print(f"{'='*30}")
 
     result_summary = {
         'experiment': f"{stroke_type}_{joint_type}_{body_part}_kfold",
         'fold_accuracies': average_accuracy, # 스칼라 값 저장
         'fold_accuracies_list': accumulated_accuracy, # 상세 기록용 리스트도 저장 추천
-        'error': final_mean_error
+        'log': logs
     }
 
     # JSON 누적 저장 로직
@@ -581,6 +333,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, devic
 
     print(f"All results saved to {summary_file_path}")
     return result_summary
+
 def main():
     """메인 실행 함수"""
     # 경로 설정
@@ -601,19 +354,19 @@ def main():
         
         # Clear - 부위별
         ('clear', 'global', 'arm'),
-        #('clear', 'local', 'arm'),
-        #('clear', 'global', 'leg'),
-        #('clear', 'local', 'leg'),
+        ('clear', 'local', 'arm'),
+        ('clear', 'global', 'leg'),
+        ('clear', 'local', 'leg'),
         
         # Drive - 전체
-        #('drive', 'global', 'total'),
-        #('drive', 'local', 'total'),
+        ('drive', 'global', 'total'),
+        ('drive', 'local', 'total'),
         
         # Drive - 부위별
-        #('drive', 'global', 'arm'),
-        #('drive', 'local', 'arm'),
-        #('drive', 'global', 'leg'),
-        #('drive', 'local', 'leg'),
+        ('drive', 'global', 'arm'),
+        ('drive', 'local', 'arm'),
+        ('drive', 'global', 'leg'),
+        ('drive', 'local', 'leg'),
     ]
     """experiments = [
             # Clear - 전체
@@ -629,7 +382,7 @@ def main():
                 joint_type,
                 body_part,
                 device=device,
-                ts2vec_epochs=150,
+                ts2vec_epochs=100,
                 classifier_epochs=100,
                 output_dir=output_dir
             )

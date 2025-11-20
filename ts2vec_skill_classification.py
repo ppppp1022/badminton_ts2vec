@@ -2,15 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import h5py
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
 from typing import List, Dict
 import os
 from processed_data_loader import ProcessedBadmintonDataset
 from preprocess_badminton_data import load_skill_levels_from_annotation
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, mean_squared_error
+from torch.utils.data import Dataset, DataLoader
+import time
+from tqdm import tqdm 
+
 
 # ============================================================================
 # 1. TS2Vec 모델 구현
@@ -126,35 +128,6 @@ class TS2VecLoss(nn.Module):
 # 2. Skill Level 분류 모델
 # ============================================================================
 
-class AttentionSkillClassifier(nn.Module):
-    """Self-attention 메커니즘 사용"""
-    def __init__(self, embedding_dim, num_classes=7):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(embedding_dim, num_heads=4, batch_first=True)
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_classes)
-        )
-        
-    def forward(self, x):
-        # x: (batch, embedding_dim)
-        x_expanded = x.unsqueeze(1)  # (batch, 1, embedding_dim)
-        
-        # Self-attention
-        attn_output, _ = self.attention(x_expanded, x_expanded, x_expanded)
-        attn_output = attn_output.squeeze(1)  # (batch, embedding_dim)
-        
-        # Residual connection
-        x = x + attn_output
-        
-        # Classification
-        return self.classifier(x)
-
 class SkillLevelClassifier(nn.Module):
     """TS2Vec 임베딩으로부터 skill level 분류 (Batch Norm 추가 버전)"""
     def __init__(self, embedding_dim, num_classes=7):
@@ -196,171 +169,124 @@ class SkillLevelClassifier(nn.Module):
 # 4. 학습 파이프라인
 # ============================================================================
 
-class TS2VecTrainer:
-    """TS2Vec 학습 클래스"""
-    def __init__(self, model, lr=0.001, temperature=0.05, device='cuda'):
+
+class StrokeDataset(Dataset):
+    
+    def __init__(self, data_list, labels=None):
+        self.strokes = data_list
+        self.labels = []
+        self.has_labels = labels is not None
+        
+        # 모든 subject의 stroke들을 하나의 리스트로 펼침
+        if self.has_labels:
+            self.labels = labels
+    
+    def __len__(self):
+        return len(self.strokes)
+    
+    def __getitem__(self, idx):
+        data = torch.tensor(self.strokes[idx], dtype=torch.float32)
+        if self.has_labels:
+            label = torch.tensor(self.labels[idx], dtype=torch.long)
+            return data, label
+        return data
+
+
+def collate_fn_with_labels(batch):
+    
+    padded = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=0)
+    
+    # Mask 생성 - True=진짜 데이터, False=패딩
+    mask = (padded.abs().sum(dim=-1) > 0)
+    
+    return padded, mask
+
+class ImprovedTS2VecTrainer:
+    """DataLoader를 사용하는 TS2Vec Trainer"""
+    def __init__(self, model, lr=0.001, device='cuda'):
         self.model = model.to(device)
         self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        self.criterion = TS2VecLoss(temperature=temperature)
-        
+        # TS2VecLoss는 model과 별도로 정의되어 있다고 가정
+        self.loss_fn = TS2VecLoss(temperature=0.5)
+
     def augment(self, x):
         """
-        TS2Vec-style augmentation (강화 버전)
-        1. Jittering (노이즈): 강도 증가
-        2. Scaling (크기): 범위 확대
-        3. Permutation (구간 섞기): [New] 시간 순서를 섞어서 '지렁이' 끊기
+        TS2Vec-style augmentation
+        1. Jittering (노이즈)
+        2. Scaling (크기)
+        3. Masking (구간 가리기)
+        
+        Args:
+            x: (batch, seq_len, features)
+        
+        Returns:
+            x_aug: augmented version
         """
         batch_size, seq_len, feature_dim = x.shape
+        x_aug = x.clone()
         
-        # --- 1. Stronger Jittering (노이즈 추가) ---
-        # 기존 0.005 -> 0.02~0.03으로 상향 (데이터 스케일에 따라 조절 필요)
-        noise = torch.randn_like(x) * 0.02
-        x_aug = x + noise
+        # --- 1. Jittering (노이즈 추가) ---
+        noise = torch.randn_like(x_aug) * 0.03
+        x_aug = x_aug + noise
         
-        # --- 2. Stronger Scaling (크기 변형) ---
-        # 기존 0.1 -> 0.3으로 상향 (0.7배 ~ 1.3배 크기로 변함)
-        scale = torch.randn(batch_size, 1, 1, device=x.device) * 0.3 + 1
+        # --- 2. Scaling (크기 변형) ---
+        scale = torch.randn(batch_size, 1, 1, device=x.device) * 0.1 + 1
         x_aug = x_aug * scale
-        """
-        # --- 3. Permutation (구간 섞기 - 핵심!) ---
-        # 시계열을 N개의 구간으로 자른 뒤 순서를 랜덤하게 섞습니다.
-        # 모델이 "전체적인 시간 흐름"보다는 "동작의 핵심 패턴"에 집중하게 만듭니다.
+        
+        # --- 3. Masking (구간 가리기) ---
+        # 30% 확률로 전체 길이의 1/4 구간을 0으로 만듦
         if np.random.random() < 0.5:
-            mask_len = x.shape[1] // 4  # 전체 길이의 1/4 정도를 가림
-            start = np.random.randint(0, x.shape[1] - mask_len)
-            x_aug[:, start:start+mask_len, :] = 0"""
-        # 30%의 확률로만 적용 (너무 많이 하면 원본 정보가 파괴될 수 있음)
-        """if np.random.random() < 0.3:
-            max_segments = 5
-            num_segments = np.random.randint(2, max_segments + 1)
+            mask_len = seq_len // 3
+            if mask_len > 0:
+                start = np.random.randint(0, max(1, seq_len - mask_len))
+                x_aug[:, start:start+mask_len, :] = 0
             
-            # 구간 길이 계산
-            seg_len = seq_len // num_segments
-            
-            # 텐서를 구간별로 쪼갬
-            segments = []
-            for i in range(num_segments):
-                start = i * seg_len
-                # 마지막 구간은 남은거 다 포함
-                end = (i + 1) * seg_len if i < num_segments - 1 else seq_len
-                segments.append(x_aug[:, start:end, :])
-                
-            # 섞기 (Shuffle)
-            import random
-            random.shuffle(segments)
-            
-            # 다시 합치기
-            x_aug = torch.cat(segments, dim=1)"""
-            
-        return x, x_aug # x: 원본(약한 aug), x_aug: 강한 aug
+        return x_aug
     
-    def train_epoch(self, data_list: List[np.ndarray], batch_size=32):
-        """1 에폭 학습"""
-        self.model.train()
+    def train_epoch(self, dataloader):
         total_loss = 0
         num_batches = 0
+        total_samples = 0
         
-        # 1. 모든 stroke를 하나의 리스트로 평탄화 (Flatten)
-        all_strokes = []
-        for subject_data in data_list:
-            for stroke in subject_data:
-                # numpy array -> torch tensor 변환을 미리 해둠
-                all_strokes.append(torch.tensor(stroke, dtype=torch.float32))
-        
-        # 2. Shuffle (리스트 자체를 섞음)
-        # 길이가 다르므로 np.random.permutation 인덱싱 대신 리스트를 섞는게 안전함
-        import random
-        random.shuffle(all_strokes)
+        # 시작 시간 기록
+        for batch_idx, (batch_data, mask) in enumerate(dataloader):
 
-        # 3. Batch 학습 (직접 루프)
-        for i in range(0, len(all_strokes), batch_size):
-            batch_list = all_strokes[i:i+batch_size]
+            batch_data = batch_data.to(self.device, non_blocking=True)
+            mask = mask.to(self.device, non_blocking=True)
             
-            if len(batch_list) < 2: # 배치가 너무 작으면 패스 (Contrastive Loss 계산 불가)
-                continue
+            # Data Augmentation: 두 개의 view 생성
+            x_aug1 = self.augment(batch_data)
+            x_aug2 = self.augment(batch_data)
             
-            # [핵심 수정] pad_sequence로 배치 내 길이 통일 (Padding)
-            # 결과 shape: (Batch, Max_Length, Feature)
-            batch_tensor = pad_sequence(batch_list, batch_first=True, padding_value=0).to(self.device)
+            # Forward: 두 augmented view의 representation 추출
+            _, z1 = self.model(x_aug1, mask)  # (batch, length, output_dim)
+            _, z2 = self.model(x_aug2, mask)  # (batch, length, output_dim)
             
-            # [핵심 수정] Mask 생성 (Padding된 부분은 False, 진짜 데이터는 True)
-            # (Batch, Max_Length) 형태
-            mask = (batch_tensor.abs().sum(dim=-1) > 0)
-            
-            # Augmentation
-            _, x1 = self.augment(batch_tensor) # 첫 번째 뷰
-            _, x2 = self.augment(batch_tensor) # 두 번째 뷰
-            
-            # Forward (Mask 전달!)
-            # 이전 턴의 TS2Vec 모델이 mask를 받도록 수정되었다고 가정
-            _, z1 = self.model(x1, mask=mask)
-            _, z2 = self.model(x2, mask=mask)
-            
-            # Loss Calculation
-            loss = self.criterion(z1, z2)
+            # TS2Vec Contrastive Loss 계산
+            loss = self.loss_fn(z1, z2)
             
             # Backward
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
-            
-            total_loss += loss.item()
-            num_batches += 1
-        
-        return total_loss / num_batches if num_batches > 0 else 0
 
-    def save_model(self, stroke_type: str, joint_type: str, body_part: str, save_dir='./EmbeddingModel'):
-        """임베딩 모델 저장"""
-        os.makedirs(save_dir, exist_ok=True)
-        
-        model_name = f"ts2vec_{stroke_type}_{joint_type}_{body_part}.pth"
-        model_path = os.path.join(save_dir, model_name)
-        
-        checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'model_config': {
-                'input_dim': self.model.input_dim,
-                'hidden_dim': self.model.hidden_dim,
-                'output_dim': self.model.output_dim
-            },
-            'stroke_type': stroke_type,
-            'joint_type': joint_type
-        }
-        
-        torch.save(checkpoint, model_path)
-        print(f"Model saved to {model_path}")
-        return model_path
-    
-    @staticmethod
-    def load_model(stroke_type: str, joint_type: str, body_part: str, device='cuda', save_dir='./EmbeddingModel'):
-        """저장된 임베딩 모델 로드"""
-        model_name = f"ts2vec_{stroke_type}_{joint_type}_{body_part}.pth"
-        model_path = os.path.join(save_dir, model_name)
-        
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model not found: {model_path}")
-        
-        checkpoint = torch.load(model_path, map_location=device)
-        
-        # 모델 재생성 부분에서 class TS2Vec이 정의되어 있어야 함
-        config = checkpoint['model_config']
-        
-        model = TS2Vec(
-            input_dim=config['input_dim'],
-            hidden_dim=config['hidden_dim'],
-            output_dim=config['output_dim']
-        )
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
-        
-        trainer = TS2VecTrainer(model, device=device)
-        trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        print(f"Model loaded from {model_path}")
-        return model, trainer
+            batch_size_actual = batch_data.size(0)
+
+            total_samples += batch_size_actual
+
+            total_loss += loss.item()
+
+            num_batches += 1
+
+            # 통계 수집
+            total_loss += loss.item()
+           
+        return total_loss / num_batches
+
+# ============================================================================
+# 5. 메인 실행 파이프라인
+# ============================================================================
 
 class SkillLevelTrainer:
     """Skill Level 분류기 학습"""
@@ -377,38 +303,35 @@ class SkillLevelTrainer:
             param.requires_grad = False
         self.ts2vec_model.eval()
         
-    def extract_embeddings(self, data_list: List[np.ndarray], batch_size=64) -> np.ndarray:
-        """
-        TS2Vec으로 임베딩 추출 (Batch Processing + Padding/Masking 적용)
-        """
+    def extract_embeddings(self, data_list: List[np.ndarray]) -> np.ndarray:
         self.ts2vec_model.eval()
+        
+        device = next(self.ts2vec_model.parameters()).device
         embeddings = []
-        
-        # 1. 모든 데이터를 하나의 리스트로 풀기 (Flatten)
-        all_strokes = []
-        for subject_data in data_list:
-            for stroke in subject_data:
-                all_strokes.append(torch.tensor(stroke, dtype=torch.float32))
-        
-        # 2. 배치 단위로 처리 (속도 대폭 향상)
-        with torch.no_grad():
-            for i in range(0, len(all_strokes), batch_size):
-                batch_list = all_strokes[i:i+batch_size]
+
+        for stroke in data_list:
+            
+            stroke_tensor = torch.FloatTensor(stroke).unsqueeze(0).to(device)
+            
+            mask = torch.ones((1, stroke.shape[0]), dtype=torch.bool).to(device)
+            
+            with torch.no_grad():
+                output = self.ts2vec_model(stroke_tensor, mask)
                 
-                # [중요] Padding: 길이가 다른 스윙들을 맞춰줌
-                batch_tensor = pad_sequence(batch_list, batch_first=True, padding_value=0).to(self.device)
+                if isinstance(output, tuple):
+                    reprs = output[1] 
+                else:
+                    reprs = output
+
+                reprs = reprs.transpose(1, 2)
                 
-                # [중요] Mask 생성: 0인 부분은 임베딩 계산에서 제외
-                mask = (batch_tensor.abs().sum(dim=-1) > 0)
+                pool_out = F.max_pool1d(reprs, kernel_size=reprs.size(-1))
                 
-                # TS2Vec Encode (Mask 전달!)
-                # shape: (Batch, Output_Dim)
-                embedding_batch = self.ts2vec_model.encode(batch_tensor, mask=mask)
+                vector = pool_out.squeeze().cpu().numpy()
                 
-                embeddings.append(embedding_batch.cpu().numpy())
-        
-        # 리스트들을 하나의 거대한 넘파이 배열로 합침
-        return np.vstack(embeddings)
+                embeddings.append(vector)
+                
+        return np.vstack(embeddings) # 또는 np.vstack(embeddings)
     
     def train_epoch(self, embeddings: np.ndarray, labels: np.ndarray, batch_size=32):
         """1 에폭 학습"""
@@ -484,9 +407,7 @@ class SkillLevelTrainer:
             'report': report,
             'confusion_matrix': cm.tolist() # JSON 저장을 위해 리스트 변환
         }
-# ============================================================================
-# 5. 메인 실행 파이프라인
-# ============================================================================
+
 
 def main():
     # 설정
