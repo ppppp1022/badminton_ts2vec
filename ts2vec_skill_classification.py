@@ -10,8 +10,6 @@ from preprocess_badminton_data import load_skill_levels_from_annotation
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, mean_squared_error
 from torch.utils.data import Dataset, DataLoader
-import time
-from tqdm import tqdm 
 
 
 # ============================================================================
@@ -322,15 +320,13 @@ class SkillLevelTrainer:
                     reprs = output[1] 
                 else:
                     reprs = output
-
                 reprs = reprs.transpose(1, 2)
                 
                 pool_out = F.max_pool1d(reprs, kernel_size=reprs.size(-1))
                 
                 vector = pool_out.squeeze().cpu().numpy()
-                
                 embeddings.append(vector)
-                
+        
         return np.vstack(embeddings) # 또는 np.vstack(embeddings)
     
     def train_epoch(self, embeddings: np.ndarray, labels: np.ndarray, batch_size=32):

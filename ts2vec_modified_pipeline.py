@@ -10,8 +10,12 @@ from preprocess_badminton_data import load_skill_levels_from_annotation
 from processed_data_loader import ProcessedBadmintonDataset
 import torch.optim as optim
 import json
+import matplotlib.pyplot as plt
 import os
 import numpy as np
+from sklearn.manifold import TSNE
+import seaborn as sns
+import pandas as pd
 
 
 def setup_dataset(processed_data_folder):
@@ -168,6 +172,7 @@ class TS2Vec:
     """사용자가 데이터를 넣기 쉽도록 만든 래퍼 클래스"""
     def __init__(self, input_dims, output_dims=320, hidden_dims=64, depth=10, device='cuda'):
         self.device = device
+        self.hidden_dims = hidden_dims
         self.model = DilatedConvEncoder(input_dims, output_dims, hidden_dims, depth).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
         
@@ -201,8 +206,9 @@ class TS2Vec:
                 self.optimizer.zero_grad()
                 
                 # Timestamp Masking 생성 (Bernoulli p=0.5) [cite: 132]
-                mask1 = torch.from_numpy(np.random.binomial(1, 0.5, x1.shape)).to(self.device).float()
-                mask2 = torch.from_numpy(np.random.binomial(1, 0.5, x2.shape)).to(self.device).float()
+                
+                mask1 = torch.from_numpy(np.random.binomial(1, 0.5, size=(x1.shape[0], x1.shape[1], 1))).to(self.device).float()
+                mask2 = torch.from_numpy(np.random.binomial(1, 0.5, size=(x2.shape[0], x2.shape[1], 1))).to(self.device).float()
                 
                 # Forward Pass (두 개의 뷰 생성)
                 z1 = self.model(x1, mask1)
@@ -236,9 +242,147 @@ class TS2Vec:
                 outputs.append(out.cpu().numpy())
                 
         return np.concatenate(outputs, axis=0)
+
+def visualize_embeddings(embeddings, labels, fold_idx, save_dir, suffix="Test"):
+    """
+    T-SNE 시각화 및 저장
+    Args:
+        embeddings: 임베딩 벡터 (numpy array)
+        labels: 라벨 (numpy array)
+        fold_idx: 현재 Fold 번호
+        save_dir: 저장할 폴더 경로 (예: ./results/tsne_images)
+        suffix: 파일명 및 제목 접미사 (Train 또는 Test)
+    """
+    embeddings = np.max(embeddings, axis=1)
+    print(f"Pooling 후 형태: {embeddings.shape}") # (3000, 64)
+
+    if type(labels) is list:
+        labels = np.array(labels)
+
+    # NaN 값 안전 장치 (이전 에러 방지)
+    if np.isnan(embeddings).any():
+        print(f"⚠️ Warning: NaN found in {suffix} embeddings. Replacing with 0 for visualization.")
+        embeddings = np.nan_to_num(embeddings)
+
+    print(f"Generating T-SNE for Fold {fold_idx} ({suffix})...")
+    
+    # T-SNE 설정 (init='random'으로 안정성 확보)
+    tsne = TSNE(
+        n_components=2, 
+        random_state=42, 
+        perplexity=30, 
+        max_iter=1000
+    )
+    
+    # 데이터가 너무 많으면 시간이 오래 걸리므로 3000개 정도로 샘플링하는 것도 방법
+    # 여기선 일단 전체 다 그립니다.
+    tsne_results = tsne.fit_transform(embeddings)
+
+    print(f"t-SNE 결과 형태: {tsne_results.shape}") # (3000, 2)
+    # 시각화 데이터프레임
+    
+    df = pd.DataFrame({
+        'x': tsne_results[:, 0],
+        'y': tsne_results[:, 1],
+        'Skill Level': labels.astype(int)
+    })
+    
+    # 그래프 그리기
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(
+        data=df, 
+        x='x', y='y', 
+        hue='Skill Level', 
+        palette='viridis', 
+        style='Skill Level',
+        s=50, 
+        alpha=0.7
+    )
+    
+    plt.title(f'Fold {fold_idx} T-SNE ({suffix})')
+    plt.xlabel('Dim 1')
+    plt.ylabel('Dim 2')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    
+    
+    # 파일 저장 (폴더는 이미 만들어져 있다고 가정하거나 여기서 생성)
+    os.makedirs(save_dir, exist_ok=True)
+    filename = f'tsne_fold_{fold_idx}_{suffix}.png'
+    save_path = os.path.join(save_dir, filename)
+    
+    plt.savefig(save_path, dpi=300)
+    plt.close() # 메모리 해제
+    print(f"Saved: {save_path}")
+
+
+def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch = 20, batch_size=16,
+                         hidden_dim = 64, output_dim = 64, device='cuda', output_dir='./results'):
+    """
+    K-Fold 교차 검증 실험 실행 함수.
+    
+    Args:
+        dataset: ProcessedBadmintonDataset 객체
+        stroke_type: 'clear' 또는 'drive'
+        joint_type: 'global' 또는 'local'
+        body_part: 'total', 'arm', 또는 'leg'
+        k: K-Fold 개수
+        epoch: TS2Vec 학습 epoch 수
+        output_dim: TS2Vec 출력 차원
+        hidden_dim: TS2Vec 은닉 차원
+        batch_size: 배치 크기
+        device: 학습에 사용할 디바이스 ('cuda', 'mps', 'cpu' 등)
+        output_dir: 결과 저장 디렉토리 경로
+    Returns:
+        results: 실험 결과 딕셔너리
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    tsne_save_dir = os.path.join(output_dir, 'tsne_images')
+    os.makedirs(tsne_save_dir, exist_ok=True)
+
+    folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
+    accumulated_accuracy = []
+    logs = []
+
+    print(f"Starting experiment: {stroke_type}_{joint_type}_{body_part}")
+    
+    for fold_idx in range(k):
+        print(f"\n{'='*20}\n Fold {fold_idx+1} / {k} \n{'='*20}")
+        
+        # --- 1. 데이터 준비 ---
+        train_data = [stroke for i, fold in enumerate(folds) if i != fold_idx for stroke in fold]
+        test_data = folds[fold_idx]
+        train_labels =[l for i, label in enumerate(labels) if i != fold_idx for l in label]
+        test_labels = labels[fold_idx]
+
+        sample_data = train_data[0]
+        input_dim = len(sample_data[0]) 
+        print(f"Input dimension: {input_dim}")
+        print(f"\n[Step 1] Training TS2Vec (Self-Supervised)...{len(train_data)}")
+
+        train_data = np.array(train_data)
+        test_data = np.array(test_data)
+        
+        model = TS2Vec(input_dims=input_dim, hidden_dims=hidden_dim, output_dims=output_dim, device=device)
+        model.fit(train_data=train_data, n_epochs=epoch, batch_size=batch_size)
+
+        train_embeddings = model.encode(train_data)
+        
+        print(f"추출된 표현의 형태: {train_embeddings.shape}")
+
+        visualize_embeddings(
+            train_embeddings, 
+            train_labels, 
+            fold_idx=fold_idx+1, 
+            save_dir=tsne_save_dir, # 하위 폴더 지정
+            suffix="Train"
+        )
+
+
 def main():
     processed_data_folder = './Processed_Data'
-    output_dir = './results_lstm'
+    output_dir = './results_ts2vec'
     
     device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
     print(f"Using device: {device}")
@@ -272,16 +416,19 @@ def main():
     all_results = []
     for stroke_type, joint_type, body_part in experiments:
         try:
-            result = run_kfold_experiment(
-                dataset,
-                stroke_type,
-                joint_type,
-                body_part,
+            run_kfold_experiment(
+                dataset=dataset,
+                stroke_type=stroke_type,
+                joint_type=joint_type,
+                body_part=body_part,
+                k=5,
+                epoch=20,
+                batch_size=16,
+                hidden_dim=64,
+                output_dim=64,
                 device=device,
                 output_dir=output_dir
-            )
-            if result:
-                all_results.append(result)
+            )    
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
             import traceback

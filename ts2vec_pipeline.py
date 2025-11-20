@@ -262,7 +262,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, devic
         # 임베딩 추출 (배치 처리된 개선 버전 사용 권장)
         train_embeddings = skill_trainer.extract_embeddings(train_data)
         test_embeddings = skill_trainer.extract_embeddings(test_data)
-
+        print(train_embeddings.shape)
         train_labels_expanded = np.array(train_labels, dtype=np.float32)
         test_labels_expanded = np.array(test_labels, dtype=np.float32)
         
@@ -382,8 +382,8 @@ def main():
                 joint_type,
                 body_part,
                 device=device,
-                ts2vec_epochs=100,
-                classifier_epochs=100,
+                ts2vec_epochs=1,
+                classifier_epochs=1,
                 output_dir=output_dir
             )
             if result:
