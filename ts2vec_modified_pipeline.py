@@ -674,8 +674,8 @@ def main():
                 k=5,
                 epoch=100,
                 batch_size=64,
-                hidden_dim=64,
-                output_dim=32,
+                hidden_dim=128,
+                output_dim=128,
                 device=device,
                 output_dir=output_dir
             )    
