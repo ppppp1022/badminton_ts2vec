@@ -370,12 +370,15 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         print(f"\n[Step 1] Training TS2Vec (Self-Supervised)...{len(train_data)}")
 
         train_data = np.array(train_data)
+        crop_start = 20
+        crop_end = 130  # 150 - 20
+        trimmed_data = train_data[:, crop_start:crop_end, :]
         test_data = np.array(test_data)
         
         model = TS2Vec(input_dims=input_dim, hidden_dims=hidden_dim, output_dims=output_dim, device=device)
-        model.fit(train_data=train_data, n_epochs=epoch, batch_size=batch_size)
+        model.fit(train_data=trimmed_data, n_epochs=epoch, batch_size=batch_size)
 
-        train_embeddings = model.encode(train_data)
+        train_embeddings = model.encode(trimmed_data)
         
 
         visualize_embeddings(
