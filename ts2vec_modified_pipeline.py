@@ -16,6 +16,7 @@ import numpy as np
 from sklearn.manifold import TSNE
 import seaborn as sns
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 
 def setup_dataset(processed_data_folder):
@@ -71,7 +72,7 @@ class DilatedConvEncoder(nn.Module):
     논문에 기술된 Dilated CNN 아키텍처입니다.
     입력 투영(Input Projection) -> 타임스탬프 마스킹(Masking) -> Dilated CNN 순서로 처리합니다.
     """
-    def __init__(self, in_channels, out_channels, hidden_size=64, depth=10):
+    def __init__(self, in_channels, out_channels, hidden_size=64, depth=8):
         super().__init__()
         self.input_fc = nn.Linear(in_channels, hidden_size) # Input Projection Layer [cite: 86]
         
@@ -170,11 +171,11 @@ def temporal_contrastive_loss(z1, z2):
 
 class TS2Vec:
     """사용자가 데이터를 넣기 쉽도록 만든 래퍼 클래스"""
-    def __init__(self, input_dims, output_dims=320, hidden_dims=64, depth=10, device='cuda'):
+    def __init__(self, input_dims, output_dims=320, hidden_dims=64, depth=8, device='cuda'):
         self.device = device
         self.hidden_dims = hidden_dims
         self.model = DilatedConvEncoder(input_dims, output_dims, hidden_dims, depth).to(device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.0001)
         
     def fit(self, train_data, n_epochs=20, batch_size=8):
         """
@@ -182,8 +183,12 @@ class TS2Vec:
         train_data shape: (N_samples, Time_length, Features)
         """
         self.model.train()
-        train_tensor = torch.from_numpy(train_data).float().to(self.device)
-        N, T, F_dim = train_tensor.shape
+        
+        N, T, F_dim = train_data.shape
+        scaler = StandardScaler()
+        input_data_scaled = scaler.fit_transform(train_data.reshape(-1, F_dim)).reshape(N, T, F_dim)
+        
+        train_tensor = torch.from_numpy(input_data_scaled).float().to(self.device)
         
         for epoch in range(n_epochs):
             idx = np.random.permutation(N)
@@ -207,8 +212,8 @@ class TS2Vec:
                 
                 # Timestamp Masking 생성 (Bernoulli p=0.5) [cite: 132]
                 
-                mask1 = torch.from_numpy(np.random.binomial(1, 0.5, size=(x1.shape[0], x1.shape[1], 1))).to(self.device).float()
-                mask2 = torch.from_numpy(np.random.binomial(1, 0.5, size=(x2.shape[0], x2.shape[1], 1))).to(self.device).float()
+                mask1 = torch.from_numpy(np.random.binomial(1, 0.3, size=(x1.shape[0], x1.shape[1], 1))).to(self.device).float()
+                mask2 = torch.from_numpy(np.random.binomial(1, 0.3, size=(x2.shape[0], x2.shape[1], 1))).to(self.device).float()
                 
                 # Forward Pass (두 개의 뷰 생성)
                 z1 = self.model(x1, mask1)
@@ -219,8 +224,8 @@ class TS2Vec:
                 loss.backward()
                 self.optimizer.step()
                 epoch_loss += loss.item()
-                
-            print(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss / (N//batch_size):.4f}")
+            if (epoch+1) % 10 == 0:
+                print(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss / (N//batch_size):.4f}")
 
     def encode(self, data, batch_size=8):
         """
@@ -260,9 +265,10 @@ def visualize_embeddings(embeddings, labels, fold_idx, save_dir, suffix="Test"):
         labels = np.array(labels)
 
     # NaN 값 안전 장치 (이전 에러 방지)
-    if np.isnan(embeddings).any():
+    if np.isnan(embeddings).any() or np.isinf(embeddings).any():
         print(f"⚠️ Warning: NaN found in {suffix} embeddings. Replacing with 0 for visualization.")
         embeddings = np.nan_to_num(embeddings)
+        embeddings[np.isinf(embeddings)] = 0
 
     print(f"Generating T-SNE for Fold {fold_idx} ({suffix})...")
     
@@ -271,7 +277,9 @@ def visualize_embeddings(embeddings, labels, fold_idx, save_dir, suffix="Test"):
         n_components=2, 
         random_state=42, 
         perplexity=30, 
-        max_iter=1000
+        max_iter=1000,
+        init='random',
+        learning_rate='auto'
     )
     
     # 데이터가 너무 많으면 시간이 오래 걸리므로 3000개 정도로 샘플링하는 것도 방법
@@ -369,7 +377,6 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
 
         train_embeddings = model.encode(train_data)
         
-        print(f"추출된 표현의 형태: {train_embeddings.shape}")
 
         visualize_embeddings(
             train_embeddings, 
@@ -422,8 +429,8 @@ def main():
                 joint_type=joint_type,
                 body_part=body_part,
                 k=5,
-                epoch=20,
-                batch_size=16,
+                epoch=1,
+                batch_size=64,
                 hidden_dim=64,
                 output_dim=64,
                 device=device,
