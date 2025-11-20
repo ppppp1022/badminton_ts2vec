@@ -17,6 +17,7 @@ from sklearn.manifold import TSNE
 import seaborn as sns
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from ts2vec_skill_classification import SkillLevelClassifier, SkillLevelTrainer
 
 
 def setup_dataset(processed_data_folder):
@@ -171,7 +172,7 @@ def temporal_contrastive_loss(z1, z2):
 
 class TS2Vec:
     """사용자가 데이터를 넣기 쉽도록 만든 래퍼 클래스"""
-    def __init__(self, input_dims, output_dims=320, hidden_dims=64, depth=8, device='cuda'):
+    def __init__(self, input_dims, output_dims=320, hidden_dims=64, depth=10, device='cuda'):
         self.device = device
         self.hidden_dims = hidden_dims
         self.model = DilatedConvEncoder(input_dims, output_dims, hidden_dims, depth).to(device)
@@ -212,8 +213,8 @@ class TS2Vec:
                 
                 # Timestamp Masking 생성 (Bernoulli p=0.5) [cite: 132]
                 
-                mask1 = torch.from_numpy(np.random.binomial(1, 0.3, size=(x1.shape[0], x1.shape[1], 1))).to(self.device).float()
-                mask2 = torch.from_numpy(np.random.binomial(1, 0.3, size=(x2.shape[0], x2.shape[1], 1))).to(self.device).float()
+                mask1 = torch.from_numpy(np.random.binomial(1, 0.5, size=(x1.shape[0], x1.shape[1], 1))).to(self.device).float()
+                mask2 = torch.from_numpy(np.random.binomial(1, 0.5, size=(x2.shape[0], x2.shape[1], 1))).to(self.device).float()
                 
                 # Forward Pass (두 개의 뷰 생성)
                 z1 = self.model(x1, mask1)
@@ -370,15 +371,17 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         print(f"\n[Step 1] Training TS2Vec (Self-Supervised)...{len(train_data)}")
 
         train_data = np.array(train_data)
-        crop_start = 20
-        crop_end = 130  # 150 - 20
-        trimmed_data = train_data[:, crop_start:crop_end, :]
+        velocity_data = np.diff(train_data, axis=1)
+        acceleration_data = np.diff(velocity_data, axis=1)
         test_data = np.array(test_data)
-        
-        model = TS2Vec(input_dims=input_dim, hidden_dims=hidden_dim, output_dims=output_dim, device=device)
-        model.fit(train_data=trimmed_data, n_epochs=epoch, batch_size=batch_size)
 
-        train_embeddings = model.encode(trimmed_data)
+        train_data = train_data[:, 50:130, :]
+        test_data = test_data[:, 50:130, :]
+
+        model = TS2Vec(input_dims=input_dim, hidden_dims=hidden_dim, output_dims=output_dim, device=device)
+        model.fit(train_data=train_data, n_epochs=epoch, batch_size=batch_size)
+
+        train_embeddings = model.encode(acceleration_data)
         
 
         visualize_embeddings(
@@ -389,6 +392,61 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
             suffix="Train"
         )
 
+        skill_trainer = SkillLevelTrainer(
+            model,
+            SkillLevelClassifier(embedding_dim=hidden_dim, num_classes=7), # num_classes 명시 권장,
+            lr=0.001,
+            device=device
+        )
+
+        test_embeddings = model.encode(test_data)
+
+        for e in range(epoch):
+            loss = skill_trainer.train_epoch(train_embeddings, train_labels, batch_size=batch_size)
+            if (e + 1) % 10 == 0:
+                print(f'  Epoch {e+1}/{epoch}, Classifier Loss: {loss:.4f}')
+        
+        print("\n[Step 3] Evaluating...")
+        results = skill_trainer.evaluate(test_embeddings, test_labels)
+        print(f"Fold {fold_idx+1} Accuracy: {results['accuracy']:.4f}")
+
+        logs.append(results['report'])
+        accumulated_accuracy.append(results['accuracy'])
+    
+    average_accuracy = sum(accumulated_accuracy) / k
+    
+    print(f"\n{'='*30}")
+    print(f"Final Result ({k}-Fold CV)")
+    print(f"Avg Accuracy: {average_accuracy:.4f}")
+    print(f"{'='*30}")
+
+    result_summary = {
+        'experiment': f"{stroke_type}_{joint_type}_{body_part}_kfold",
+        'fold_accuracies': average_accuracy, # 스칼라 값 저장
+        'fold_accuracies_list': accumulated_accuracy, # 상세 기록용 리스트도 저장 추천
+        'log': logs
+    }
+
+    # JSON 누적 저장 로직
+    summary_file_path = os.path.join(output_dir, 'all_results_summary.json')
+    
+    existing_data = []
+    if os.path.exists(summary_file_path):
+        with open(summary_file_path, 'r', encoding='utf-8') as f:
+            try:
+                existing_data = json.load(f)
+                if not isinstance(existing_data, list):
+                    existing_data = [existing_data]
+            except json.JSONDecodeError:
+                existing_data = []
+                
+    existing_data.append(result_summary)
+
+    with open(summary_file_path, 'w', encoding='utf-8') as f:
+        json.dump(existing_data, f, indent=2, ensure_ascii=False)
+
+    print(f"All results saved to {summary_file_path}")
+    return result_summary
 
 def main():
     processed_data_folder = './Processed_Data'
@@ -432,10 +490,10 @@ def main():
                 joint_type=joint_type,
                 body_part=body_part,
                 k=5,
-                epoch=1,
+                epoch=100,
                 batch_size=64,
-                hidden_dim=64,
-                output_dim=64,
+                hidden_dim=128,
+                output_dim=512,
                 device=device,
                 output_dir=output_dir
             )    
