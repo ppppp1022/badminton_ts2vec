@@ -2,26 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
 from preprocess_badminton_data import load_skill_levels_from_annotation
 from processed_data_loader import ProcessedBadmintonDataset
 import torch.optim as optim
 import json
 import matplotlib.pyplot as plt
 import os
-import numpy as np
 from sklearn.manifold import TSNE
 import seaborn as sns
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-import seaborn as sns
-from sklearn.model_selection import train_test_split
-from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-
 
 def setup_dataset(processed_data_folder):
     """
@@ -150,28 +141,77 @@ def hierarchical_contrastive_loss(z1, z2, alpha=0.5, temporal_unit=0):
         
     return loss / d
 
+
 def instance_contrastive_loss(z1, z2):
-    """배치 내의 다른 인스턴스를 Negative로 간주 [cite: 165]"""
+    """
+    [최적화] Instance-wise Contrastive Loss (Vectorized)
+    - for 문 제거로 속도 대폭 향상
+    """
     B, T = z1.size(0), z1.size(1)
     if B == 1: return z1.new_tensor(0.)
+    
     z = torch.cat([z1, z2], dim=0)  # 2B x T x C
     z = z.transpose(0, 1)  # T x 2B x C
     sim = torch.matmul(z, z.transpose(1, 2))  # T x 2B x 2B
-    logits = torch.tril(sim, diagonal=-1)[:, :, :-1]    # 대각 성분 제외 단순화
-    logits += torch.triu(sim, diagonal=1)[:, :, 1:]
-    logits = -F.log_softmax(logits, dim=-1)
-    return logits.mean()
-
-def temporal_contrastive_loss(z1, z2):
-    """같은 인스턴스 내의 다른 타임스탬프를 Negative로 간주 [cite: 155]"""
-    B, T = z1.size(0), z1.size(1)
-    if T == 1: return z1.new_tensor(0.)
-    z = torch.cat([z1, z2], dim=1)  # B x 2T x C
-    sim = torch.matmul(z, z.transpose(1, 2))  # B x 2T x 2T
+    
+    # 대각 성분 제외 로직 (Vectorized)
     logits = torch.tril(sim, diagonal=-1)[:, :, :-1]
     logits += torch.triu(sim, diagonal=1)[:, :, 1:]
-    logits = -F.log_softmax(logits, dim=-1)
-    return logits.mean()
+    
+    logits = -F.log_softmax(logits, dim=-1) # T x 2B x (2B-1)
+    
+    # --- [Vectorization 핵심] ---
+    # for t in range(T) 루프를 없애고, T차원과 2B차원을 합칩니다.
+    # (T * 2B, 2B - 1) 형태로 만듭니다.
+    logits = logits.reshape(-1, 2 * B - 1)
+    
+    # 정답 타겟 생성 (한 타임스텝에 대한 정답)
+    # z1 파트 (0~B-1) -> 정답: i + B - 1
+    # z2 파트 (B~2B-1) -> 정답: i
+    target_z1 = torch.arange(B, device=z1.device) + B - 1
+    target_z2 = torch.arange(B, device=z1.device)
+    target = torch.cat([target_z1, target_z2]) # (2B,)
+    
+    # 모든 타임스텝(T)에 대해 정답이 똑같으므로 반복해서 확장
+    target = target.repeat(T) # (T * 2B,)
+    
+    # 한 번에 Gather & Mean (GPU 병렬 연산)
+    loss = logits.gather(1, target.view(-1, 1)).mean()
+    
+    return loss
+
+def temporal_contrastive_loss(z1, z2):
+    """
+    [최적화] Temporal Contrastive Loss (Vectorized)
+    - for 문 제거로 속도 대폭 향상
+    """
+    B, T = z1.size(0), z1.size(1)
+    if T == 1: return z1.new_tensor(0.)
+    
+    z = torch.cat([z1, z2], dim=1)  # B x 2T x C
+    sim = torch.matmul(z, z.transpose(1, 2))  # B x 2T x 2T
+    
+    logits = torch.tril(sim, diagonal=-1)[:, :, :-1]
+    logits += torch.triu(sim, diagonal=1)[:, :, 1:]
+    
+    logits = -F.log_softmax(logits, dim=-1) # B x 2T x (2T-1)
+    
+    # --- [Vectorization 핵심] ---
+    # for b in range(B) 루프 제거
+    # (B * 2T, 2T - 1) 형태로 Flatten
+    logits = logits.reshape(-1, 2 * T - 1)
+    
+    # 정답 타겟 생성
+    target_t1 = torch.arange(T, device=z1.device) + T - 1
+    target_t2 = torch.arange(T, device=z1.device)
+    target = torch.cat([target_t1, target_t2]) # (2T,)
+    
+    # 모든 배치(B)에 대해 정답 반복
+    target = target.repeat(B) # (B * 2T,)
+    
+    loss = logits.gather(1, target.view(-1, 1)).mean()
+    
+    return loss
 
 class TS2Vec:
     """사용자가 데이터를 넣기 쉽도록 만든 래퍼 클래스"""
@@ -179,7 +219,7 @@ class TS2Vec:
         self.device = device
         self.hidden_dims = hidden_dims
         self.model = DilatedConvEncoder(input_dims, output_dims, hidden_dims, depth).to(device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.0001)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
         
     def fit(self, train_data, n_epochs=20, batch_size=8):
         """
@@ -200,6 +240,52 @@ class TS2Vec:
             
             for i in range(0, N, batch_size):
                 batch = train_tensor[idx[i:i+batch_size]]
+                
+                # Random Cropping: 두 개의 겹치는 구간 샘플링 [cite: 135]
+                ts_l = batch.size(1)
+                crop_l = np.random.randint(low=2, high=ts_l + 1)
+                
+                # 논문 방식대로 간단한 랜덤 크롭 구현
+                start1 = np.random.randint(ts_l - crop_l + 1)
+                start2 = start1
+                
+                x1 = batch[:, start1 : start1 + crop_l, :]
+                x2 = batch[:, start2 : start2 + crop_l, :]
+                
+                self.optimizer.zero_grad()
+                
+                # Timestamp Masking 생성 (Bernoulli p=0.5) [cite: 132]
+                
+                mask1 = torch.from_numpy(np.random.binomial(1, 0.2, size=(x1.shape[0], x1.shape[1], 1))).to(self.device).float()
+                mask2 = torch.from_numpy(np.random.binomial(1, 0.2, size=(x2.shape[0], x2.shape[1], 1))).to(self.device).float()
+                
+                # Forward Pass (두 개의 뷰 생성)
+                z1 = self.model(x1, mask1)
+                z2 = self.model(x2, mask2)
+                
+                # Hierarchical Loss 계산
+                loss = hierarchical_contrastive_loss(z1, z2, alpha=0.5)
+                loss.backward()
+                self.optimizer.step()
+                epoch_loss += loss.item()
+            if (epoch+1) % 10 == 0:
+                print(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss / (N//batch_size):.4f}")
+
+    def test_batch(self, train_data, n_epochs=20, batch_size=8):
+        self.model.train()
+        
+        N, T, F_dim = train_data.shape
+        scaler = StandardScaler()
+        input_data_scaled = scaler.fit_transform(train_data.reshape(-1, F_dim)).reshape(N, T, F_dim)
+        
+        train_tensor = torch.from_numpy(input_data_scaled).float().to(self.device)
+
+        for epoch in range(n_epochs):
+            idx = np.random.permutation(N)
+            epoch_loss = 0
+            
+            for i in range(0, N, batch_size):
+                batch = train_tensor[idx[:batch_size]]
                 
                 # Random Cropping: 두 개의 겹치는 구간 샘플링 [cite: 135]
                 ts_l = batch.size(1)
@@ -230,7 +316,6 @@ class TS2Vec:
                 epoch_loss += loss.item()
             if (epoch+1) % 10 == 0:
                 print(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss / (N//batch_size):.4f}")
-
     def encode(self, data, batch_size=8):
         """
         추론 함수. 전체 시계열에 대한 표현을 반환합니다.
@@ -327,16 +412,9 @@ def visualize_embeddings(embeddings, labels, fold_idx, save_dir, suffix="Test"):
     plt.close() # 메모리 해제
     print(f"Saved: {save_path}")
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 
 class TS2VecNNClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim=128, dropout=0.5, device='cuda'):
+    def __init__(self, input_dim, num_classes, hidden_dim=128, dropout=0.2, device='cuda'):
         super().__init__()
         self.device = device
         
@@ -437,21 +515,11 @@ class TS2VecNNClassifier(nn.Module):
         print(f"\n>>> 최종 테스트 정확도: {acc:.4f} ({acc*100:.2f}%) <<<\n")
         
         print(">>> 상세 분류 리포트 <<<")
-        print(classification_report(y_true, y_pred, target_names=label_names, digits=4))
-        
+        log = classification_report(y_true, y_pred, target_names=label_names, digits=4)
         cm = confusion_matrix(y_true, y_pred)
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
-        plt.title(f'Confusion Matrix (Acc: {acc*100:.2f}%)')
-        plt.xlabel('Predicted Label')
-        plt.ylabel('True Label')
+        print(cm)
         
-        if label_names:
-            plt.xticks(np.arange(len(label_names)) + 0.5, label_names, rotation=45)
-            plt.yticks(np.arange(len(label_names)) + 0.5, label_names, rotation=0)
-            
-        plt.show()
-        return acc, 
+        return acc, log
 
 def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch = 20, batch_size=16,
                          hidden_dim = 64, output_dim = 64, device='cuda', output_dir='./results'):
@@ -490,8 +558,8 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         # --- 1. 데이터 준비 ---
         train_data = [stroke for i, fold in enumerate(folds) if i != fold_idx for stroke in fold]
         test_data = folds[fold_idx]
-        train_labels =[l for i, label in enumerate(labels) if i != fold_idx for l in label]
-        test_labels = labels[fold_idx]
+        train_labels =[l-1 for i, label in enumerate(labels) if i != fold_idx for l in label]
+        test_labels = [l-1 for i, label in enumerate(labels) if i == fold_idx for l in label]
 
         sample_data = train_data[0]
         input_dim = len(sample_data[0]) 
@@ -503,8 +571,8 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         acceleration_data = np.diff(velocity_data, axis=1)
         test_data = np.array(test_data)
 
-        train_data = train_data[:, 50:130, :]
-        test_data = test_data[:, 50:130, :]
+        train_labels = np.array(train_labels)
+        test_labels = np.array(test_labels)
 
         model = TS2Vec(input_dims=input_dim, hidden_dims=hidden_dim, output_dims=output_dim, device=device)
         model.fit(train_data=train_data, n_epochs=epoch, batch_size=batch_size)
@@ -520,12 +588,13 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
             suffix="Train"
         )
 
-        nn_classifier = TS2VecNNClassifier(input_dim=hidden_dim, num_classes=7, hidden_dim=128, device=device)
+        nn_classifier = TS2VecNNClassifier(input_dim=output_dim, num_classes=7, hidden_dim=128, device=device)
         nn_classifier.fit(train_embeddings, train_labels, epochs=epoch)
 
-        accuracy = nn_classifier.evaluate(test_embeddings, test_labels)
+        accuracy, log = nn_classifier.evaluate(test_embeddings, test_labels)
 
         accumulated_accuracy.append(accuracy)
+        logs.append(log)
     
     average_accuracy = sum(accumulated_accuracy) / k
     
@@ -595,7 +664,6 @@ def main():
         #('drive', 'local', 'leg'),
     ]
     # 각 실험 실행
-    all_results = []
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(
@@ -606,8 +674,8 @@ def main():
                 k=5,
                 epoch=100,
                 batch_size=64,
-                hidden_dim=128,
-                output_dim=512,
+                hidden_dim=64,
+                output_dim=32,
                 device=device,
                 output_dir=output_dir
             )    
