@@ -221,7 +221,7 @@ class TS2Vec:
         self.model = DilatedConvEncoder(input_dims, output_dims, hidden_dims, depth).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
         
-    def fit(self, train_data, n_epochs=20, batch_size=8):
+    def fit(self, train_data, n_epochs=20, batch_size=8, alpha = 0.3):
         """
         학습 함수.
         train_data shape: (N_samples, Time_length, Features)
@@ -247,7 +247,7 @@ class TS2Vec:
                 
                 # 논문 방식대로 간단한 랜덤 크롭 구현
                 start1 = np.random.randint(ts_l - crop_l + 1)
-                start2 = start1
+                start2 = np.random.randint(ts_l - crop_l + 1)
                 
                 x1 = batch[:, start1 : start1 + crop_l, :]
                 x2 = batch[:, start2 : start2 + crop_l, :]
@@ -264,58 +264,14 @@ class TS2Vec:
                 z2 = self.model(x2, mask2)
                 
                 # Hierarchical Loss 계산
-                loss = hierarchical_contrastive_loss(z1, z2, alpha=0.5)
+                loss = hierarchical_contrastive_loss(z1, z2, alpha=alpha)
                 loss.backward()
                 self.optimizer.step()
                 epoch_loss += loss.item()
             if (epoch+1) % 10 == 0:
                 print(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss / (N//batch_size):.4f}")
 
-    def test_batch(self, train_data, n_epochs=20, batch_size=8):
-        self.model.train()
-        
-        N, T, F_dim = train_data.shape
-        scaler = StandardScaler()
-        input_data_scaled = scaler.fit_transform(train_data.reshape(-1, F_dim)).reshape(N, T, F_dim)
-        
-        train_tensor = torch.from_numpy(input_data_scaled).float().to(self.device)
-
-        for epoch in range(n_epochs):
-            idx = np.random.permutation(N)
-            epoch_loss = 0
-            
-            for i in range(0, N, batch_size):
-                batch = train_tensor[idx[:batch_size]]
-                
-                # Random Cropping: 두 개의 겹치는 구간 샘플링 [cite: 135]
-                ts_l = batch.size(1)
-                crop_l = np.random.randint(low=2, high=ts_l + 1)
-                
-                # 논문 방식대로 간단한 랜덤 크롭 구현
-                start1 = np.random.randint(ts_l - crop_l + 1)
-                start2 = np.random.randint(ts_l - crop_l + 1)
-                
-                x1 = batch[:, start1 : start1 + crop_l, :]
-                x2 = batch[:, start2 : start2 + crop_l, :]
-                
-                self.optimizer.zero_grad()
-                
-                # Timestamp Masking 생성 (Bernoulli p=0.5) [cite: 132]
-                
-                mask1 = torch.from_numpy(np.random.binomial(1, 0.5, size=(x1.shape[0], x1.shape[1], 1))).to(self.device).float()
-                mask2 = torch.from_numpy(np.random.binomial(1, 0.5, size=(x2.shape[0], x2.shape[1], 1))).to(self.device).float()
-                
-                # Forward Pass (두 개의 뷰 생성)
-                z1 = self.model(x1, mask1)
-                z2 = self.model(x2, mask2)
-                
-                # Hierarchical Loss 계산
-                loss = hierarchical_contrastive_loss(z1, z2, alpha=0.5)
-                loss.backward()
-                self.optimizer.step()
-                epoch_loss += loss.item()
-            if (epoch+1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_loss / (N//batch_size):.4f}")
+    
     def encode(self, data, batch_size=8):
         """
         추론 함수. 전체 시계열에 대한 표현을 반환합니다.
@@ -522,7 +478,7 @@ class TS2VecNNClassifier(nn.Module):
         return acc, log
 
 def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch = 20, batch_size=16,
-                         hidden_dim = 64, output_dim = 64, device='cuda', output_dir='./results'):
+                         hidden_dim = 64, output_dim = 64, alpha = 0.3, device='cuda', output_dir='./results'):
     """
     K-Fold 교차 검증 실험 실행 함수.
     
@@ -543,7 +499,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    tsne_save_dir = os.path.join(output_dir, 'tsne_images')
+    tsne_save_dir = os.path.join(output_dir, f'tsne_images_{batch_size}_{hidden_dim}_{output_dim}_{alpha}')
     os.makedirs(tsne_save_dir, exist_ok=True)
 
     folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
@@ -589,7 +545,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         )
 
         nn_classifier = TS2VecNNClassifier(input_dim=output_dim, num_classes=7, hidden_dim=128, device=device)
-        nn_classifier.fit(train_embeddings, train_labels, epochs=epoch)
+        nn_classifier.fit(train_embeddings, train_labels, epochs=100)
 
         accuracy, log = nn_classifier.evaluate(test_embeddings, test_labels)
 
@@ -605,6 +561,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
 
     result_summary = {
         'experiment': f"{stroke_type}_{joint_type}_{body_part}_kfold",
+        'parameter': f"{epoch}, {batch_size}, {hidden_dim}, {output_dim}, {alpha}",
         'fold_accuracies': average_accuracy, # 스칼라 값 저장
         'fold_accuracies_list': accumulated_accuracy, # 상세 기록용 리스트도 저장 추천
         'log': logs
@@ -666,19 +623,14 @@ def main():
     # 각 실험 실행
     for stroke_type, joint_type, body_part in experiments:
         try:
-            run_kfold_experiment(
-                dataset=dataset,
-                stroke_type=stroke_type,
-                joint_type=joint_type,
-                body_part=body_part,
-                k=5,
-                epoch=100,
-                batch_size=64,
-                hidden_dim=128,
-                output_dim=128,
-                device=device,
-                output_dir=output_dir
-            )    
+            run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
+                epoch=150,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.3)
+            run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
+                epoch=100,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.5)
+            run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
+                epoch=100,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.7)
+            run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
+                epoch=100,batch_size=64,hidden_dim=128,output_dim=512,alpha = 0.3)
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
             import traceback
