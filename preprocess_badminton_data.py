@@ -130,8 +130,8 @@ def process_subject(subject_folder, forehand_df, backhand_df, order_forehand):
             local_position = local_data[time_start_index:time_stop_index]
             global_position = global_data[time_start_index:time_stop_index]
 
-            local_resampled = resize_scipy(local_position, 150)
-            global_resampled = resize_scipy(global_position, 150)
+            local_resampled = resize_scipy(local_position, 300)
+            global_resampled = resize_scipy(global_position, 300)
 
             data_np = np.array(local_resampled)
             means = np.mean(data_np, axis=0)
@@ -186,8 +186,8 @@ def process_subject(subject_folder, forehand_df, backhand_df, order_forehand):
 
             if len(local_position)==0:
                 continue
-            local_resampled = resize_scipy(local_position, 150)
-            global_resampled = resize_scipy(global_position, 150)
+            local_resampled = resize_scipy(local_position, 300)
+            global_resampled = resize_scipy(global_position, 300)
 
             data_np = np.array(local_resampled)
             means = np.mean(data_np, axis=0)
