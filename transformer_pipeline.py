@@ -1,14 +1,13 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
+import math
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import json
+import matplotlib.pyplot as plt
+import os
 from preprocess_badminton_data import load_skill_levels_from_annotation
 from processed_data_loader import ProcessedBadmintonDataset
-import torch.optim as optim
-import json
-import os
-import numpy as np
-from ts2vec_skill_classification import collate_fn_with_labels
 
 def setup_dataset(processed_data_folder):
     """
@@ -58,16 +57,14 @@ def setup_dataset(processed_data_folder):
     
     return dataset
 
-import torch
-import torch.nn as nn
-import math
-
-# 1. 순서 정보를 주입하는 모듈 (보통 그대로 복사해서 씁니다)
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
+    """
+    논문의 3.5절에 나오는 Positional Encoding 구현 [cite: 161]
+    순서 정보(Time)를 주입하기 위해 사인/코사인 함수를 사용합니다.
+    """
+    def __init__(self, d_model, max_len=500):
+        super(PositionalEncoding, self).__init__()
         
-        # 위치별로 고유한 값을 미리 계산
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
@@ -75,175 +72,210 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         
-        # (Batch 차원 추가) -> (1, max_len, d_model)
+        # (Max_Len, d_model) -> (1, Max_Len, d_model)로 배치 차원 추가
         self.register_buffer('pe', pe.unsqueeze(0))
 
     def forward(self, x):
         # x: (Batch, Seq_Len, d_model)
-        # 입력 길이에 맞춰서 위치 정보를 더해줌
-        return x + self.pe[:, :x.size(1), :]
+        # 입력 길이에 맞춰서 잘라서 더해줌
+        return x + self.pe[:, :x.size(1)]
 
-# 2. 메인 Transformer 모델
-class SwingTransformer(nn.Module):
-    def __init__(self, input_dim, num_classes, d_model=128, nhead=4, num_layers=3, dropout=0.1):
-        super().__init__()
+class BadmintonTransformer(nn.Module):
+    def __init__(self, input_dim=63, d_model=128, nhead=4, num_layers=3, num_classes=7, dropout=0.1):
+        super(BadmintonTransformer, self).__init__()
         
-        # (1) 입력 차원 변환 (예: 20개 관절 -> 128차원)
-        self.input_proj = nn.Linear(input_dim, d_model)
+        # 1. Input Projection (63 -> d_model)
+        # 연속된 센서 값은 Embedding 레이어 대신 Linear 레이어를 씁니다.
+        self.input_linear = nn.Linear(input_dim, d_model)
         
-        # (2) 위치 정보 추가
+        # 2. Positional Encoding
         self.pos_encoder = PositionalEncoding(d_model)
         
-        # (3) 트랜스포머 인코더 층 설정
-        # batch_first=True를 써야 (Batch, Time, Feature) 모양 그대로 넣을 수 있음
+        # 3. Transformer Encoder Layer
+        # 논문의 Encoder 구조 
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # (4) 최종 분류기
+        # 4. Classifier
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, 64),
             nn.ReLU(),
-            nn.Linear(d_model // 2, num_classes)
+            nn.Dropout(dropout),
+            nn.Linear(64, num_classes)
         )
 
-    def forward(self, x, mask=None):
-        """
-        x: (Batch, Time, Input_Dim)
-        mask: (Batch, Time) -> True가 진짜 데이터, False가 패딩인 마스크 (Collate_fn에서 만든 것)
-        """
+    def forward(self, x):
+        # x shape: (Batch, Time, 63)
         
-        # 1. 임베딩 & 위치 인코딩
-        x = self.input_proj(x) # (Batch, Time, d_model)
+        # [Step 1] Feature Projection
+        x = self.input_linear(x) # (Batch, Time, d_model)
+        
+        # [Step 2] Positional Encoding (순서 정보 주입)
         x = self.pos_encoder(x)
         
-        # 2. 마스크 처리 (중요!)
-        # PyTorch Transformer는 'True'를 패딩(무시할 곳)으로 인식합니다.
-        # 하지만 우리가 만든 mask는 'True'가 진짜 데이터입니다.
-        # 따라서 반전(~)을 시켜줘야 합니다.
-        if mask is not None:
-            # mask: (Batch, Time) -> True(Data), False(Pad)
-            # padding_mask: True(Pad), False(Data) 로 변환
-            padding_mask = ~mask
-        else:
-            padding_mask = None
-            
-        # 3. 인코더 통과
-        # src_key_padding_mask에 반전된 마스크를 넣습니다.
-        output = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
+        # [Step 3] Transformer Encoder 통과
+        # output shape: (Batch, Time, d_model)
+        # 각 프레임이 전체 시퀀스를 참고한 특징을 갖게 됨
+        x = self.transformer_encoder(x)
         
-        # 4. Pooling (시계열 요약)
-        # 방법 A: 단순히 평균 내기 (Global Average Pooling)
-        # 패딩된 부분(0)까지 평균에 들어가면 안 되므로, 마스크를 고려해서 평균을 내거나
-        # 단순히 Max Pooling을 쓰는 게 편합니다.
+        # [Step 4] Aggregation (Global Average Pooling)
+        # 모든 시간(Time) 축에 대해 평균을 내어 하나의 벡터로 만듦
+        x = x.mean(dim=1) # (Batch, d_model)
         
-        # 여기선 TS2Vec처럼 Max Pooling 사용 (가장 강한 특징 추출)
-        # (Batch, Time, d_model) -> (Batch, d_model)
-        output = output.transpose(1, 2) # (Batch, d_model, Time)
-        output = torch.max(output, dim=2)[0] 
+        # [Step 5] Classification
+        output = self.classifier(x)
         
-        # 5. 최종 분류
-        logits = self.classifier(output)
-        
-        return logits
+        return output
 
-def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, transformer_epoch=100, device='cuda', 
-                        hidden_size=256, num_layers=3, output_dir='./results'):
-    """
-    K-Fold 교차 검증 실험 실행
-    """
+class BadmintonDataset(Dataset):
+    def __init__(self, data_list, labels):
+        self.data = data_list
+        self.labels = labels
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        # 데이터: (Time, 63) 형태라고 가정
+        x = torch.tensor(self.data[idx], dtype=torch.float32)
+        y = torch.tensor(self.labels[idx], dtype=torch.long)
+        return x, y
+
+def pad_collate_fn(batch):
+    # batch = [(x1, y1), (x2, y2), ...]
+    inputs, labels = zip(*batch)
+    
+    # 패딩 적용 (길이가 짧은 스윙 뒤에 0을 채움)
+    # batch_first=True -> (Batch, Time, Feature)
+    inputs_padded = nn.utils.rnn.pad_sequence(inputs, batch_first=True, padding_value=0)
+    
+    # 라벨 합치기
+    labels = torch.tensor(labels, dtype=torch.long)
+    return inputs_padded, labels
+
+
+def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch = 20, batch_size = 64,
+                         input_dim = 63, d_model = 128, nhead = 4, num_layer = 3, device='cuda', output_dir='./results'):
+
     os.makedirs(output_dir, exist_ok=True)
+    
+    tsne_save_dir = os.path.join(output_dir, f'tsne_images_{batch_size}_{input_dim}_{d_model}_{nhead}')
+    os.makedirs(tsne_save_dir, exist_ok=True)
 
     folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
     accumulated_accuracy = []
-    total_error = []
 
+    print(f"Starting experiment: {stroke_type}_{joint_type}_{body_part}")
+    
     for fold_idx in range(k):
-        print(f"\n=== Fold {fold_idx+1}/{k} Start ===")
+        print(f"\n{'='*20}\n Fold {fold_idx+1} / {k} \n{'='*20}")
         
-        # Fold에 따른 Subject 리스트 생성
+        # --- 1. 데이터 준비 ---
         train_data = [stroke for i, fold in enumerate(folds) if i != fold_idx for stroke in fold]
         test_data = folds[fold_idx]
-        train_labels =[l for i, label in enumerate(labels) if i != fold_idx for l in label]
-        test_labels = labels[fold_idx]
+        train_labels =[l-1 for i, label in enumerate(labels) if i != fold_idx for l in label]
+        test_labels = [l-1 for i, label in enumerate(labels) if i == fold_idx for l in label]
 
         sample_data = train_data[0]
-        input_size = len(sample_data[0])
-        print(f"Input size: {input_size}, Train samples: {len(train_data)}, Test samples: {len(test_data)}")
+        input_dim = len(sample_data[0]) 
+        print(f"Input dimension: {input_dim}")
+        print(f"\n[Step 1] Training TS2Vec (Self-Supervised)...{len(train_data)}")
+
+        train_data = np.array(train_data)
+        test_data = np.array(test_data)
+
         
-        temp_tensors = [torch.tensor(s, dtype=torch.float32) for s in train_data]
-        train_data_tensor = nn.utils.rnn.pad_sequence(temp_tensors, batch_first=True, padding_value=0)
-        train_label_tensor = torch.tensor(train_labels, dtype=torch.long)
+        # 1. DataLoader 생성
+        train_dataset = BadmintonDataset(train_data, train_labels)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+        
+        test_dataset = BadmintonDataset(test_data, test_labels)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
 
-        temp_tensors = [torch.tensor(s, dtype=torch.float32) for s in test_data]
-        test_data_tensor = nn.utils.rnn.pad_sequence(temp_tensors, batch_first=True, padding_value=0)
-        test_label_tensor = torch.tensor(test_labels, dtype=torch.long)
+        train_labels = np.array(train_labels)
+        test_labels = np.array(test_labels)
 
-        # DataLoader 생성
-        train_dataset = TensorDataset(train_data_tensor, train_label_tensor)
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2, pin_memory=True, collate_fn=collate_fn_with_labels)
+        model = BadmintonTransformer(input_dim=input_dim, d_model=d_model, nhead=nhead, num_layers=num_layer).to(device)
+        
+        criterion = nn.CrossEntropyLoss() # 회귀(예측) 문제 가정
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        
+        for epoch in range(epoch):
+            total_loss = 0
+            for x_batch, y_batch in train_loader:
+                # x_batch: (Batch, Seq_Len, Dims) -> Wrapper 내부에서 5D로 변환됨
+                # y_batch: (Batch, Dims)
+                x_batch = x_batch.to(device, non_blocking=True)
+                y_batch = y_batch.to(device, non_blocking=True)
 
-        # [수정 1] 모델 정의: num_classes=7 (1~7단계를 분류하므로)
-        # [수정 2] .to(device) 추가: 모델을 GPU로 이동
-        model = SwingTransformer(input_size, 7).to(device)
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-        # --- 학습 루프 ---
-        print("Training lstm...")
-        model.train()
-
-        for epoch in range(transformer_epoch):
-            epoch_loss = 0.0
-            
-            for inputs, labels in train_loader:
-                # [수정 3] 데이터도 GPU로 이동해야 함
-                inputs, labels = inputs.to(device), labels.to(device)
-                
                 optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
                 
-                epoch_loss += loss.item()
-
-            if (epoch+1) % 10 == 0:
-                avg_loss = epoch_loss / len(train_loader)
-                print(f"Epoch [{epoch+1}/{transformer_epoch}], Avg Loss: {avg_loss:.4f}")
-
-        # --- 평가 루프 ---
-        print("Evaluating model...")
-        
-        # [수정 4] Test 데이터 GPU 이동 및 변수명 통일 (test_label_tensor)
-        test_data_tensor = test_data_tensor.to(device)
-        test_label_tensor = test_label_tensor.to(device)
+                pred = model(x_batch) # Forward
+                
+                loss = criterion(pred, y_batch) # Loss 계산
+                loss.backward() # Backprop
+                optimizer.step() # Update
+                
+                total_loss += loss.item()
+            
+            if (epoch+1)%10 == 0:
+                print(f"Epoch {epoch+1}, Loss: {total_loss / len(train_loader):.4f}")
         
         model.eval()
-        with torch.no_grad():
-            test_outputs = model(test_data_tensor)
-            predicted_classes = torch.argmax(test_outputs, dim=1)
-            
-            # [수정 5] 정확도 계산 시 변수명 오타 수정
-            correct_tensor = (predicted_classes == test_label_tensor)
-            mean_errors.append(np.mean(abs(avg_pred - subject_true) for subject_true, avg_pred in zip(test_label_tensor.cpu().numpy(), predicted_classes.cpu().numpy())))
-            correct_count = correct_tensor.sum().item()
-            total_count = test_label_tensor.size(0)
+        correct = 0
+        total = 0
 
-            accuracy = correct_count / total_count
-            print(f"Fold {fold_idx+1} Accuracy: {accuracy:.4f}")
-        mean_errors = np.mean(mean_errors)
+        with torch.no_grad(): # 그래디언트 계산 비활성화 (메모리 절약, 속도 향상)
+            for inputs, test_labels in test_loader:
+                inputs, test_labels = inputs.to(device), test_labels.to(device)
+                
+                outputs = model(inputs) # 모델 예측값 (Logits)
+                
+                # 가장 높은 확률을 가진 클래스 인덱스 추출
+                # _: max value (확률값), predicted: max index (예측 클래스 번호)
+                _, predicted = torch.max(outputs.data, 1)
+                
+                total += test_labels.size(0) # 전체 샘플 수
+                correct += (predicted == test_labels).sum().item() # 맞은 개수 누적
+        accuracy = correct / total
         accumulated_accuracy.append(accuracy)
-
+        print(accuracy)
+    
     average_accuracy = sum(accumulated_accuracy) / k
-    print(f"\nAverage Accuracy over {k} folds: {average_accuracy:.4f}")
+    
+    print(f"\n{'='*30}")
+    print(f"Final Result ({k}-Fold CV)")
+    print(f"Avg Accuracy: {average_accuracy:.4f}")
+    print(f"{'='*30}")
 
     result_summary = {
         'experiment': f"{stroke_type}_{joint_type}_{body_part}_kfold",
-        'fold_accuracies': accumulated_accuracy,
-        'average_accuracy': average_accuracy,
-        'error': mean_errors
+        'parameter': f"{batch_size}, {input_dim}, {d_model}, {nhead}",
+        'fold_accuracies': average_accuracy, # 스칼라 값 저장
+        'fold_accuracies_list': accumulated_accuracy, # 상세 기록용 리스트도 저장 추천
     }
+
+    # JSON 누적 저장 로직
+    summary_file_path = os.path.join(output_dir, 'all_results_summary.json')
+    
+    existing_data = []
+    if os.path.exists(summary_file_path):
+        with open(summary_file_path, 'r', encoding='utf-8') as f:
+            try:
+                existing_data = json.load(f)
+                if not isinstance(existing_data, list):
+                    existing_data = [existing_data]
+            except json.JSONDecodeError:
+                existing_data = []
+                
+    existing_data.append(result_summary)
+
+    with open(summary_file_path, 'w', encoding='utf-8') as f:
+        json.dump(existing_data, f, indent=2, ensure_ascii=False)
+
+    print(f"All results saved to {summary_file_path}")
     return result_summary
+
 def main():
     processed_data_folder = './Processed_Data'
     output_dir = './results_transformer'
@@ -257,53 +289,39 @@ def main():
     # 실험 조합 정의
     experiments = [
         # Clear - 전체
-        ('clear', 'global', 'total'),
-        ('clear', 'local', 'total'),
+        #('clear', 'global', 'total'),
+        #('clear', 'local', 'total'),
         
         # Clear - 부위별
-        ('clear', 'global', 'arm'),
-        ('clear', 'local', 'arm'),
-        ('clear', 'global', 'leg'),
-        ('clear', 'local', 'leg'),
+        #('clear', 'global', 'arm'),
+        #('clear', 'local', 'arm'),
+        #('clear', 'global', 'leg'),
+        #('clear', 'local', 'leg'),
         
         # Drive - 전체
-        ('drive', 'global', 'total'),
-        ('drive', 'local', 'total'),
+        #('drive', 'global', 'total'),
+        #('drive', 'local', 'total'),
         
         # Drive - 부위별
-        ('drive', 'global', 'arm'),
+        #('drive', 'global', 'arm'),
         ('drive', 'local', 'arm'),
         ('drive', 'global', 'leg'),
         ('drive', 'local', 'leg'),
     ]
     # 각 실험 실행
-    all_results = []
     for stroke_type, joint_type, body_part in experiments:
         try:
-            result = run_kfold_experiment(
-                dataset,
-                stroke_type,
-                joint_type,
-                body_part,
-                device=device,
-                lstm_epoch=100,
-                hidden_size=256,
-                num_layers=3,
-                output_dir=output_dir
-            )
-            if result:
-                all_results.append(result)
+            run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
+                epoch=100,batch_size=64, input_dim = 63, d_model = 128, nhead = 4, num_layer = 3)
+            
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
             import traceback
             traceback.print_exc()
         
-    # 전체 결과 저장
-    with open(os.path.join(output_dir, 'all_results_summary.json'), 'w') as f:
-        json.dump(all_results, f, indent=2)
-    
     print(f"\nAll results saved to {output_dir}")
 
 
 if __name__ == '__main__':
     main()
+

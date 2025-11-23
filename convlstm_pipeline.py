@@ -312,6 +312,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
                 correct += (predicted == test_labels).sum().item() # 맞은 개수 누적
         accuracy = correct / total
         accumulated_accuracy.append(accuracy)
+        print(accuracy)
     
     average_accuracy = sum(accumulated_accuracy) / k
     
@@ -384,7 +385,7 @@ def main():
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=1,batch_size=64, hidden_dim=32, kernel_size=3, num_classes=7)
+                epoch=10,batch_size=64, hidden_dim=32, kernel_size=3, num_classes=7)
             
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
