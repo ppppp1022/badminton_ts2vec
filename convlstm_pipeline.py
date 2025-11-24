@@ -135,21 +135,22 @@ class ConvLSTMCell(nn.Module):
                 torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device))
 
 class SensorConvLSTM(nn.Module):
-    def __init__(self, hidden_dim=64, kernel_size=3, num_classes=10):
+    def __init__(self, num_sensors, hidden_dim=64, kernel_size=3, num_classes=10):
         """
+        :param num_sensors: 입력 데이터의 센서(Joint) 개수 (동적으로 받음)
         :param hidden_dim: ConvLSTM 내부의 은닉 상태 채널 수
-        :param kernel_size: 커널 크기 (홀수 권장, 예: 3은 좌우 센서 1개씩을 함께 봄)
+        :param kernel_size: 커널 크기
         :param num_classes: 분류할 클래스 개수
         """
         super(SensorConvLSTM, self).__init__()
         
-        self.num_sensors = 21  # 센서 개수 (Spatial Width)
+        self.num_sensors = num_sensors  # 동적으로 설정됨
         self.input_channels = 3 # x, y, z (Input Depth)
         self.hidden_dim = hidden_dim
         
         # 1. ConvLSTM Cell 초기화
         # 높이가 1이므로 커널의 높이도 1로 고정 (1, kernel_size)
-        # 패딩을 적절히 주어 센서 개수(21)가 유지되도록 함
+        # 패딩을 적절히 주어 센서 개수(W)가 유지되도록 함
         padding = (0, kernel_size // 2) 
         self.conv_lstm = ConvLSTMCell(input_dim=self.input_channels, 
                                       hidden_dim=hidden_dim, 
@@ -165,36 +166,28 @@ class SensorConvLSTM(nn.Module):
 
     def forward(self, x):
         """
-        :param x: (Batch, Time, 63) - Flatten된 입력
+        :param x: (Batch, Time, Features) - Flatten된 입력
         """
         b, t, d = x.size()
         
-        # [Step 1] 데이터 Reshape: (Batch, Time, 63) -> (Batch, Time, 21, 3)
-        # 63개의 값을 21개 센서의 3개 좌표로 분리
+        # [Step 1] 데이터 Reshape: (Batch, Time, Features) -> (Batch, Time, Num_Sensors, 3)
+        # Features = Num_Sensors * 3
         x = x.view(b, t, self.num_sensors, self.input_channels)
         
-        # [Step 2] Permute: (Batch, Time, 21, 3) -> (Batch, Time, 3, 1, 21)
-        # ConvLSTM은 (B, T, Channel, Height, Width)를 원하므로
-        # Channel=3 (x,y,z), Height=1, Width=21로 맞춤
+        # [Step 2] Permute: (Batch, Time, Num_Sensors, 3) -> (Batch, Time, 3, 1, Num_Sensors)
         x = x.permute(0, 1, 3, 2).unsqueeze(3)
-        # x shape: (Batch, Time, 3, 1, 21)
         
-        # 초기 상태 초기화 (H=1, W=21)
+        # 초기 상태 초기화 (H=1, W=Num_Sensors)
         h, c = self.conv_lstm.init_hidden(b, (1, self.num_sensors))
         
         # [Step 3] 시퀀스 처리 (Time loop)
         for step in range(t):
-            # 현재 프레임: (Batch, 3, 1, 21)
             current_input = x[:, step, :, :, :]
             h, c = self.conv_lstm(current_input, (h, c))
         
-        # 루프 종료 후 h의 shape: (Batch, Hidden_Dim, 1, 21)
-        # 이 h는 "각 센서 위치별로 압축된 시간적 특징"을 담고 있음
-        
         # [Step 4] Feature Aggregation
-        # 모든 센서(21개)의 정보를 평균내어 하나의 벡터로 만듦 (Global Average Pooling)
-        # dim=3(Width=21) 방향으로 평균
-        feature_vector = torch.mean(h, dim=3).squeeze(2) # (Batch, Hidden_Dim)
+        # dim=3(Width=Num_Sensors) 방향으로 평균
+        feature_vector = torch.mean(h, dim=3).squeeze(2) 
         
         # [Step 5] 최종 분류
         output = self.classifier(feature_vector)
@@ -252,7 +245,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         sample_data = train_data[0]
         input_dim = len(sample_data[0]) 
         print(f"Input dimension: {input_dim}")
-        print(f"\n[Step 1] Training TS2Vec (Self-Supervised)...{len(train_data)}")
+        print(f"\n[Step 1] Training convlstm (Self-Supervised)...{len(train_data)}")
 
         train_data = np.array(train_data)
         test_data = np.array(test_data)
@@ -267,8 +260,13 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
 
         train_labels = np.array(train_labels)
         test_labels = np.array(test_labels)
-
-        model = SensorConvLSTM(hidden_dim=hidden_dim, kernel_size=kernel_size, num_classes=num_classes).to(device)
+        num_sensors = input_dim//3
+        model = SensorConvLSTM(
+            num_sensors=num_sensors,  # 계산된 센서 개수 전달
+            hidden_dim=hidden_dim, 
+            kernel_size=kernel_size, 
+            num_classes=num_classes
+        ).to(device)
         
         criterion = nn.CrossEntropyLoss() # 회귀(예측) 문제 가정
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -276,7 +274,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         for epoch in range(epoch):
             total_loss = 0
             for x_batch, y_batch in train_loader:
-                # x_batch: (Batch, Seq_Len, Dims) -> Wrapper 내부에서 5D로 변환됨
+                # x_batch: (Batch, Seq_Len, Dims) -> Wrapper 내부에서 5D로 변환됨   
                 # y_batch: (Batch, Dims)
                 x_batch = x_batch.to(device, non_blocking=True)
                 y_batch = y_batch.to(device, non_blocking=True)
@@ -362,30 +360,30 @@ def main():
     # 실험 조합 정의
     experiments = [
         # Clear - 전체
-        ('clear', 'global', 'total'),
+        #('clear', 'global', 'total'),
         #('clear', 'local', 'total'),
         
         # Clear - 부위별
-        #('clear', 'global', 'arm'),
-        #('clear', 'local', 'arm'),
-        #('clear', 'global', 'leg'),
-        #('clear', 'local', 'leg'),
+        ('clear', 'global', 'arm'),
+        ('clear', 'local', 'arm'),
+        ('clear', 'global', 'leg'),
+        ('clear', 'local', 'leg'),
         
         # Drive - 전체
         #('drive', 'global', 'total'),
         #('drive', 'local', 'total'),
         
         # Drive - 부위별
-        #('drive', 'global', 'arm'),
-        #('drive', 'local', 'arm'),
-        #('drive', 'global', 'leg'),
-        #('drive', 'local', 'leg'),
+        ('drive', 'global', 'arm'),
+        ('drive', 'local', 'arm'),
+        ('drive', 'global', 'leg'),
+        ('drive', 'local', 'leg'),
     ]
     # 각 실험 실행
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=10,batch_size=64, hidden_dim=32, kernel_size=3, num_classes=7)
+                epoch=100,batch_size=64, hidden_dim=32, kernel_size=3, num_classes=7)
             
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
