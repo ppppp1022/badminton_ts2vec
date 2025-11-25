@@ -224,9 +224,6 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
                          hidden_dim=32, kernel_size=3, num_classes=5, device='cuda', output_dir='./results'):
 
     os.makedirs(output_dir, exist_ok=True)
-    
-    tsne_save_dir = os.path.join(output_dir, f'tsne_images_{batch_size}_{hidden_dim}_{kernel_size}_{num_classes}')
-    os.makedirs(tsne_save_dir, exist_ok=True)
 
     folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
     accumulated_accuracy = []
@@ -364,19 +361,19 @@ def main():
         #('clear', 'local', 'total'),
         
         # Clear - 부위별
-        ('clear', 'global', 'arm'),
-        ('clear', 'local', 'arm'),
-        ('clear', 'global', 'leg'),
-        ('clear', 'local', 'leg'),
+        #('clear', 'global', 'arm'),
+        #('clear', 'local', 'arm'),
+        #('clear', 'global', 'leg'),
+        #('clear', 'local', 'leg'),
         
         # Drive - 전체
         #('drive', 'global', 'total'),
         #('drive', 'local', 'total'),
         
         # Drive - 부위별
-        ('drive', 'global', 'arm'),
-        ('drive', 'local', 'arm'),
-        ('drive', 'global', 'leg'),
+        #('drive', 'global', 'arm'),
+        #('drive', 'local', 'arm'),
+        #('drive', 'global', 'leg'),
         ('drive', 'local', 'leg'),
     ]
     # 각 실험 실행

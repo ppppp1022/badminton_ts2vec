@@ -153,14 +153,10 @@ def pad_collate_fn(batch):
     labels = torch.tensor(labels, dtype=torch.long)
     return inputs_padded, labels
 
-
 def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch = 20, batch_size = 64,
                          input_dim = 63, d_model = 128, nhead = 4, num_layer = 3, device='cuda', output_dir='./results'):
 
     os.makedirs(output_dir, exist_ok=True)
-    
-    tsne_save_dir = os.path.join(output_dir, f'tsne_images_{batch_size}_{input_dim}_{d_model}_{nhead}')
-    os.makedirs(tsne_save_dir, exist_ok=True)
 
     folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
     accumulated_accuracy = []
@@ -304,8 +300,9 @@ def main():
         
         # Drive - 부위별
         #('drive', 'global', 'arm'),
-        ('drive', 'local', 'arm'),
         ('drive', 'global', 'leg'),
+        ('drive', 'local', 'arm'),
+        
         ('drive', 'local', 'leg'),
     ]
     # 각 실험 실행

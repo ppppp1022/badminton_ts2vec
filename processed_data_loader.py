@@ -4,6 +4,8 @@ from typing import List, Tuple
 import random
 import torch
 
+from preprocess_badminton_data import load_skill_levels_from_annotation
+
 class ProcessedBadmintonDataset:
     """전처리된 배드민턴 데이터셋 로더 (너의 파일구조에 맞게 수정됨)"""
     
@@ -184,46 +186,58 @@ class ProcessedBadmintonDataset:
                       f"Drive={drive_count} (skill={drive_skill:.2f})")
 
 
-# 사용 예시
-if __name__ == '__main__':
-    # 데이터셋 초기화
-    dataset = ProcessedBadmintonDataset('./Processed_Data')
+def setup_dataset(processed_data_folder):
+    """
+    데이터셋 설정
     
-    # Skill level 설정 (예시)
-    dataset.clear_skill_level = [
-        3.33, 4.0, 2.67, 5.0, 3.5, 6.0, 5.5, 4.33,  # S00-S07
-        2.5, 3.0, 4.5, 5.67, 6.33, 7.0, 3.67, 4.0,   # S08-S15
-        5.33, 6.5, 4.67, 3.33, 5.0, 6.67, 4.5, 5.5   # S16-S24
-    ]
-    dataset.drive_skill_level = [
-        3.0, 4.33, 2.33, 4.67, 3.67, 5.5, 6.0, 4.0,  # S00-S07
-        2.67, 3.33, 4.33, 5.33, 6.0, 6.67, 3.5, 4.33, # S08-S15
-        5.0, 6.33, 4.5, 3.0, 5.33, 6.5, 4.67, 5.67   # S16-S24
-    ]
+    Args:
+        annotation_filepath: Annotation Excel 파일 경로
+        processed_data_folder: 전처리된 데이터 폴더 경로
+    
+    Returns:
+        dataset: 설정된 ProcessedBadmintonDataset 객체
+    """
+    # 1. Annotation에서 skill level 로드
+    print("Step 1: Loading skill levels from annotation file")
+    
+    
+    clear_skills, drive_skills, subject_groups = load_skill_levels_from_annotation(annotation_filepath='./configs/skill_levels.json')
+
+    # 2. 데이터셋 초기화
+    print("Step 2: Initializing dataset")
+    
+    dataset = ProcessedBadmintonDataset(processed_data_folder)
+    
+    # Skill level 설정
+    
+    dataset.clear_skill_level = clear_skills
+    dataset.drive_skill_level = drive_skills
     
     # 그룹 설정
-    dataset.beginner_subjects = ['S00', 'S01', 'S02', 'S08', 'S09', 'S14', 'S19']
-    dataset.intermediate_subjects = ['S03', 'S04', 'S07', 'S10', 'S15', 'S18', 'S22']
-    dataset.expert_subjects = ['S05', 'S06', 'S11', 'S12', 'S13', 'S16', 'S17', 'S20', 'S21', 'S23']
+    dataset.beginner_subjects = subject_groups['beginner']
+    dataset.intermediate_subjects = subject_groups['intermediate']
+    dataset.expert_subjects = subject_groups['expert']
     
-    # 부위별 인덱스 설정
-    dataset.local_arm_index = [13, 14, 15, 16, 17, 18, 19, 20]
+    # 부위별 인덱스 설정 (사용자가 원하는 대로 수정)
+    # Joint indices: 0=Hips, 1-6=Legs, 7-12=Spine/Neck/Head, 13-20=Arms
+    dataset.local_arm_index = [13, 14, 15, 16, 17, 18, 19, 20]  # Right/Left Shoulder, Arm, ForeArm, Hand
     dataset.global_arm_index = [13, 14, 15, 16, 17, 18, 19, 20]
-    dataset.local_leg_index = [1, 2, 3, 4, 5, 6]
-    dataset.global_leg_index = [1, 2, 3, 4, 5, 6]
-    dataset.local_total_index = list(range(21))
+    
+    dataset.local_leg_index = [0, 1, 2, 3, 4, 5, 6]  # Hips + Legs
+    dataset.global_leg_index = [0, 1, 2, 3, 4, 5, 6]
+    
+    dataset.local_total_index = list(range(21))  # All joints
     dataset.global_total_index = list(range(21))
     
     # 통계 출력
+    #dataset.get_statistics()
+    
+    return dataset
+
+# 사용 예시
+if __name__ == '__main__':
+    # 데이터셋 초기화
+    processed_data_folder = './Processed_Data'
+    dataset = setup_dataset(processed_data_folder)
     dataset.get_statistics()
     
-    # 데이터 로드 테스트
-    print("\n=== Loading Test ===")
-    try:
-        strokes, skill = dataset.load_subject_data('S01', 'clear', 'global', 'arm')
-        print(f"\nS00 Clear data loaded:")
-        print(f"  Number of strokes: {len(strokes)}")
-        print(f"  First stroke shape: {strokes[0].shape}")
-        print(f"  Skill level: {skill:.2f}")
-    except Exception as e:
-        print(f"Error: {e}")
