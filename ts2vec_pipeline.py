@@ -473,9 +473,8 @@ class TS2VecNNClassifier(nn.Module):
         print(">>> 상세 분류 리포트 <<<")
         log = classification_report(y_true, y_pred, target_names=label_names, digits=4)
         cm = confusion_matrix(y_true, y_pred)
-        print(cm)
-        
-        return acc, log
+        cm = cm.tolist()
+        return acc, log, cm
 
 def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch = 20, batch_size=16,
                          hidden_dim = 64, output_dim = 64, alpha = 0.3, device='cuda', output_dir='./results'):
@@ -504,6 +503,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
     folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
     accumulated_accuracy = []
     logs = []
+    cms = []
 
     print(f"Starting experiment: {stroke_type}_{joint_type}_{body_part}")
     
@@ -546,21 +546,25 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         nn_classifier = TS2VecNNClassifier(input_dim=output_dim, num_classes=7, hidden_dim=128, device=device)
         nn_classifier.fit(train_embeddings, train_labels, epochs=100)
 
-        accuracy, log = nn_classifier.evaluate(test_embeddings, test_labels)
+        accuracy, log, confusion = nn_classifier.evaluate(test_embeddings, test_labels)
 
         accumulated_accuracy.append(accuracy)
         logs.append(log)
+        cms.append(confusion)
     
-    average_accuracy = sum(accumulated_accuracy) / k
+    average_accuracy = sum(accumulated_accuracy) / k * 100
+    std_accuracy = np.std(accumulated_accuracy)
     
     print(f"\n{'='*30}")
     print(f"Final Result ({k}-Fold CV)")
-    print(f"Avg Accuracy: {average_accuracy:.4f}")
+    print(f"Avg Accuracy: {average_accuracy:.4f}, Std: {std_accuracy:.4f}")
     print(f"{'='*30}")
 
     result_summary = {
         'experiment': f"{stroke_type}_{joint_type}_{body_part}_kfold",
-        'fold_accuracies': average_accuracy, # 스칼라 값 저장
+        'fold_accuracies': round(average_accuracy,2), # 스칼라 값 저장
+        'fold_std': round(std_accuracy, 3),
+        'confusion_matrix': cms,
         'fold_accuracies_list': accumulated_accuracy, # 상세 기록용 리스트도 저장 추천
         'log': logs
     }
@@ -622,13 +626,7 @@ def main():
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=150,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.3)
-            run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=100,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.5)
-            run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=100,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.7)
-            run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=100,batch_size=64,hidden_dim=128,output_dim=512,alpha = 0.3)
+                epoch=1,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.3)
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
             import traceback

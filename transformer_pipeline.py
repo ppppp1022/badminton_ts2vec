@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import os
 from preprocess_badminton_data import load_skill_levels_from_annotation
 from processed_data_loader import ProcessedBadmintonDataset
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 def setup_dataset(processed_data_folder):
     """
@@ -160,6 +161,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
 
     folds, labels = dataset.split_data_Kfold_randomly(stroke_type, k, body_part)
     accumulated_accuracy = []
+    cms = []
 
     print(f"Starting experiment: {stroke_type}_{joint_type}_{body_part}")
     
@@ -221,23 +223,30 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         correct = 0
         total = 0
 
-        with torch.no_grad(): # 그래디언트 계산 비활성화 (메모리 절약, 속도 향상)
+        all_preds = []
+        all_labels = []
+
+        with torch.no_grad():
             for inputs, test_labels in test_loader:
                 inputs, test_labels = inputs.to(device), test_labels.to(device)
                 
-                outputs = model(inputs) # 모델 예측값 (Logits)
-                
-                # 가장 높은 확률을 가진 클래스 인덱스 추출
-                # _: max value (확률값), predicted: max index (예측 클래스 번호)
+                outputs = model(inputs)
                 _, predicted = torch.max(outputs.data, 1)
-                
-                total += test_labels.size(0) # 전체 샘플 수
-                correct += (predicted == test_labels).sum().item() # 맞은 개수 누적
+
+                total += test_labels.size(0)
+                correct += (predicted == test_labels).sum().item()
+
+                # 🔥 CPU로 옮겨서 리스트에 저장
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(test_labels.cpu().numpy())
         accuracy = correct / total
         accumulated_accuracy.append(accuracy)
-        print(accuracy)
-    
-    average_accuracy = sum(accumulated_accuracy) / k
+        # 🔥 혼동 행렬 계산
+        cm = confusion_matrix(all_labels, all_preds)
+        cms.append(cm.tolist())
+            
+    average_accuracy = sum(accumulated_accuracy) / k * 100
+    std_accuracy = np.std(accumulated_accuracy)
     
     print(f"\n{'='*30}")
     print(f"Final Result ({k}-Fold CV)")
@@ -246,8 +255,9 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
 
     result_summary = {
         'experiment': f"{stroke_type}_{joint_type}_{body_part}_kfold",
-        'parameter': f"{batch_size}, {input_dim}, {d_model}, {nhead}",
-        'fold_accuracies': average_accuracy, # 스칼라 값 저장
+        'fold_accuracies': round(average_accuracy, 2), # 스칼라 값 저장
+        'fold_std': round(std_accuracy, 3),
+        'confusion_matrix': cms,
         'fold_accuracies_list': accumulated_accuracy, # 상세 기록용 리스트도 저장 추천
     }
 
@@ -285,7 +295,7 @@ def main():
     # 실험 조합 정의
     experiments = [
         # Clear - 전체
-        #('clear', 'global', 'total'),
+        ('clear', 'global', 'total'),
         #('clear', 'local', 'total'),
         
         # Clear - 부위별
@@ -300,16 +310,15 @@ def main():
         
         # Drive - 부위별
         #('drive', 'global', 'arm'),
-        ('drive', 'global', 'leg'),
-        ('drive', 'local', 'arm'),
-        
-        ('drive', 'local', 'leg'),
+        #('drive', 'global', 'leg'),
+        #('drive', 'local', 'arm'),
+        #('drive', 'local', 'leg'),
     ]
     # 각 실험 실행
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=100,batch_size=64, input_dim = 63, d_model = 128, nhead = 4, num_layer = 3)
+                epoch=1,batch_size=64, input_dim = 63, d_model = 128, nhead = 4, num_layer = 3)
             
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
