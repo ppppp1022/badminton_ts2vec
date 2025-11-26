@@ -235,14 +235,13 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
                 all_labels.extend(test_labels.cpu().numpy())
         accuracy = correct / total
         accumulated_accuracy.append(accuracy)
-        accumulated_accuracy.append(accuracy)
         print(f"accuracy {fold_idx}: {accuracy}")
         # 🔥 혼동 행렬 계산
         cm = confusion_matrix(all_labels, all_preds)
         cms.append(cm.tolist())
             
     average_accuracy = sum(accumulated_accuracy) / k * 100
-    std_accuracy = np.std(accumulated_accuracy)
+    std_accuracy = np.std(accumulated_accuracy) * 100
     
     print(f"\n{'='*30}")
     print(f"Final Result ({k}-Fold CV)")
@@ -314,7 +313,7 @@ def main():
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=50,batch_size=64, input_dim = 63, d_model = 128, nhead = 4, num_layer = 3)
+                epoch=50,batch_size=64, input_dim = 63, d_model = 96, nhead = 3, num_layer = 3)
             
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
