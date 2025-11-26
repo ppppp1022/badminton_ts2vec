@@ -177,7 +177,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         sample_data = train_data[0]
         input_dim = len(sample_data[0]) 
         print(f"Input dimension: {input_dim}")
-        print(f"\n[Step 1] Training TS2Vec (Self-Supervised)...{len(train_data)}")
+        print(f"\n[Step 1] Training trnasformer (Self-Supervised)...{len(train_data)}")
 
         train_data = np.array(train_data)
         test_data = np.array(test_data)
@@ -194,7 +194,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         test_labels = np.array(test_labels)
 
         model = BadmintonTransformer(input_dim=input_dim, d_model=d_model, nhead=nhead, num_layers=num_layer).to(device)
-        
+        model.train()
         criterion = nn.CrossEntropyLoss() # 회귀(예측) 문제 가정
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         
@@ -299,18 +299,18 @@ def main():
         #('clear', 'local', 'total'),
         
         # Clear - 부위별
-        #('clear', 'global', 'arm'),
+        ('clear', 'global', 'arm'),
         #('clear', 'local', 'arm'),
-        #('clear', 'global', 'leg'),
+        ('clear', 'global', 'leg'),
         #('clear', 'local', 'leg'),
         
         # Drive - 전체
-        #('drive', 'global', 'total'),
+        ('drive', 'global', 'total'),
         #('drive', 'local', 'total'),
         
         # Drive - 부위별
-        #('drive', 'global', 'arm'),
-        #('drive', 'global', 'leg'),
+        ('drive', 'global', 'arm'),
+        ('drive', 'global', 'leg'),
         #('drive', 'local', 'arm'),
         #('drive', 'local', 'leg'),
     ]
@@ -318,7 +318,7 @@ def main():
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=1,batch_size=64, input_dim = 63, d_model = 128, nhead = 4, num_layer = 3)
+                epoch=50,batch_size=64, input_dim = 63, d_model = 128, nhead = 4, num_layer = 3)
             
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")

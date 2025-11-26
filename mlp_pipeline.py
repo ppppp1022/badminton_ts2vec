@@ -166,6 +166,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         criterion = nn.CrossEntropyLoss() # 회귀(예측) 문제 가정
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         
+        model.train()
         for epoch_ in range(epoch):
             total_loss = 0
             for x_batch, y_batch in train_loader:
