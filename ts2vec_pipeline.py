@@ -247,7 +247,7 @@ class TS2Vec:
                 
                 # 논문 방식대로 간단한 랜덤 크롭 구현
                 start1 = np.random.randint(ts_l - crop_l + 1)
-                start2 = np.random.randint(ts_l - crop_l + 1)
+                start2 = start1
                 
                 x1 = batch[:, start1 : start1 + crop_l, :]
                 x2 = batch[:, start2 : start2 + crop_l, :]
@@ -607,26 +607,26 @@ def main():
         #('clear', 'local', 'total'),
         
         # Clear - 부위별
-        #('clear', 'global', 'arm'),
+        ('clear', 'global', 'arm'),
         #('clear', 'local', 'arm'),
-        #('clear', 'global', 'leg'),
+        ('clear', 'global', 'leg'),
         #('clear', 'local', 'leg'),
         
         # Drive - 전체
-        #('drive', 'global', 'total'),
+        ('drive', 'global', 'total'),
         #('drive', 'local', 'total'),
         
         # Drive - 부위별
-        #('drive', 'global', 'arm'),
+        ('drive', 'global', 'arm'),
         #('drive', 'local', 'arm'),
-        #('drive', 'global', 'leg'),
+        ('drive', 'global', 'leg'),
         #('drive', 'local', 'leg'),
     ]
     # 각 실험 실행
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=1,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.3)
+                epoch=100,batch_size=64,hidden_dim=128,output_dim=256,alpha = 0.3)
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
             import traceback
