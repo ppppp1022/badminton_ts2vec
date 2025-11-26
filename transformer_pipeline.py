@@ -59,13 +59,11 @@ def setup_dataset(processed_data_folder):
     return dataset
 
 class PositionalEncoding(nn.Module):
-    """
-    논문의 3.5절에 나오는 Positional Encoding 구현 [cite: 161]
-    순서 정보(Time)를 주입하기 위해 사인/코사인 함수를 사용합니다.
-    """
-    def __init__(self, d_model, max_len=500):
+    def __init__(self, d_model, max_len=500, dropout=0.1):
         super(PositionalEncoding, self).__init__()
-        
+        self.dropout = nn.Dropout(p=dropout)
+
+        # 위치 정보(PE) 계산
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
@@ -73,31 +71,32 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         
-        # (Max_Len, d_model) -> (1, Max_Len, d_model)로 배치 차원 추가
-        self.register_buffer('pe', pe.unsqueeze(0))
+        # (Max_Len, 1, Feature) -> (1, Max_Len, Feature)로 맞춰서 등록
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x: (Batch, Seq_Len, d_model)
-        # 입력 길이에 맞춰서 잘라서 더해줌
-        return x + self.pe[:, :x.size(1)]
+        # x: (Batch, Time, Feature)
+        # 입력 데이터에 위치 정보를 더해줌
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
 
-class BadmintonTransformer(nn.Module):
-    def __init__(self, input_dim=63, d_model=128, nhead=4, num_layers=3, num_classes=7, dropout=0.1):
-        super(BadmintonTransformer, self).__init__()
+class SkeletonTransformer(nn.Module):
+    def __init__(self, input_dim, num_classes=7, d_model=128, nhead=4, num_layers=3, dropout=0.2):
+        super(SkeletonTransformer, self).__init__()
         
-        # 1. Input Projection (63 -> d_model)
-        # 연속된 센서 값은 Embedding 레이어 대신 Linear 레이어를 씁니다.
-        self.input_linear = nn.Linear(input_dim, d_model)
+        # 1. 임베딩 층: 입력 차원(63)을 모델 내부 차원(128)으로 뻥튀기
+        self.embedding = nn.Linear(input_dim, d_model)
         
-        # 2. Positional Encoding
-        self.pos_encoder = PositionalEncoding(d_model)
+        # 2. 위치 인코딩 (순서 정보 주입)
+        self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
         
-        # 3. Transformer Encoder Layer
-        # 논문의 Encoder 구조 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=dropout)
+        # 3. 트랜스포머 인코더 (핵심)
+        # batch_first=True를 써야 (Batch, Time, Feat) 형태 유지 가능
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 4. Classifier
+        # 4. 분류기
         self.classifier = nn.Sequential(
             nn.Linear(d_model, 64),
             nn.ReLU(),
@@ -106,27 +105,22 @@ class BadmintonTransformer(nn.Module):
         )
 
     def forward(self, x):
-        # x shape: (Batch, Time, 63)
+        # x shape: (Batch, Time=50, Features=63)
         
-        # [Step 1] Feature Projection
-        x = self.input_linear(x) # (Batch, Time, d_model)
-        
-        # [Step 2] Positional Encoding (순서 정보 주입)
+        # 1. Embedding & Positional Encoding
+        x = self.embedding(x)  # (Batch, Time, d_model)
         x = self.pos_encoder(x)
         
-        # [Step 3] Transformer Encoder 통과
-        # output shape: (Batch, Time, d_model)
-        # 각 프레임이 전체 시퀀스를 참고한 특징을 갖게 됨
-        x = self.transformer_encoder(x)
+        # 2. Transformer Encoding
+        output = self.transformer_encoder(x) # (Batch, Time, d_model)
         
-        # [Step 4] Aggregation (Global Average Pooling)
-        # 모든 시간(Time) 축에 대해 평균을 내어 하나의 벡터로 만듦
-        x = x.mean(dim=1) # (Batch, d_model)
+        # 3. Global Average Pooling (시간 축으로 평균)
+        # 모든 프레임의 정보를 압축
+        output = output.mean(dim=1) # (Batch, d_model)
         
-        # [Step 5] Classification
-        output = self.classifier(x)
-        
-        return output
+        # 4. Classification
+        out = self.classifier(output)
+        return out
 
 class BadmintonDataset(Dataset):
     def __init__(self, data_list, labels):
@@ -193,7 +187,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         train_labels = np.array(train_labels)
         test_labels = np.array(test_labels)
 
-        model = BadmintonTransformer(input_dim=input_dim, d_model=d_model, nhead=nhead, num_layers=num_layer).to(device)
+        model = SkeletonTransformer(input_dim=input_dim, d_model=d_model, nhead=nhead, num_layers=num_layer).to(device)
         model.train()
         criterion = nn.CrossEntropyLoss() # 회귀(예측) 문제 가정
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -241,6 +235,8 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
                 all_labels.extend(test_labels.cpu().numpy())
         accuracy = correct / total
         accumulated_accuracy.append(accuracy)
+        accumulated_accuracy.append(accuracy)
+        print(f"accuracy {fold_idx}: {accuracy}")
         # 🔥 혼동 행렬 계산
         cm = confusion_matrix(all_labels, all_preds)
         cms.append(cm.tolist())
