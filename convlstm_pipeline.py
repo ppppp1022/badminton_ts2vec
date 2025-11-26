@@ -319,7 +319,7 @@ def run_kfold_experiment(dataset, stroke_type, joint_type, body_part, k=5, epoch
         cms.append(cm.tolist())
             
     average_accuracy = sum(accumulated_accuracy) / k * 100
-    std_accuracy = np.std(accumulated_accuracy)
+    std_accuracy = np.std(accumulated_accuracy) * 100
     
     print(f"\n{'='*30}")
     print(f"Final Result ({k}-Fold CV)")
@@ -372,19 +372,19 @@ def main():
         #('clear', 'local', 'total'),
         
         # Clear - 부위별
-        #('clear', 'global', 'arm'),
+        ('clear', 'global', 'arm'),
         #('clear', 'local', 'arm'),
-        #('clear', 'global', 'leg'),
+        ('clear', 'global', 'leg'),
         #('clear', 'local', 'leg'),
         
         # Drive - 전체
-        #('drive', 'global', 'total'),
+        ('drive', 'global', 'total'),
         #('drive', 'local', 'total'),
         
         # Drive - 부위별
-        #('drive', 'global', 'arm'),
+        ('drive', 'global', 'arm'),
         #('drive', 'local', 'arm'),
-        #('drive', 'global', 'leg'),
+        ('drive', 'global', 'leg'),
         #('drive', 'local', 'leg'),
     ]
     # 각 실험 실행
