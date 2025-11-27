@@ -63,24 +63,20 @@ def setup_dataset(processed_data_folder):
     #dataset.get_statistics()
     
     return dataset
-
-class ConvLSTM1DCell(nn.Module):
+# ==========================================
+# 1. ConvLSTM 2D Cell (수정 완료)
+# ==========================================
+class ConvLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
-        """
-        input_dim: 입력 채널 수 (x,y,z 니까 3)
-        hidden_dim: 은닉 상태 채널 수
-        kernel_size: 커널 크기 (예: 3 -> 인접한 3개 관절을 묶어서 봄)
-        """
-        super(ConvLSTM1DCell, self).__init__()
-        
+        super(ConvLSTMCell, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        
-        # 패딩을 (kernel_size // 2)로 주면 입력 길이(관절 수)가 유지됨
-        padding = kernel_size // 2
-        
-        # Conv1d 사용! (In + Hidden 채널을 합쳐서 연산)
-        self.conv = nn.Conv1d(in_channels=input_dim + hidden_dim,
+
+        # 입력: (Batch, Channel, Height=1, Width=21)
+        # kernel_size=(1, 3)일 때 Width(관절) 차원을 유지하기 위해 padding=(0, 1) 적용
+        padding = (0, kernel_size[1] // 2)
+
+        self.conv = nn.Conv2d(in_channels=input_dim + hidden_dim,
                               out_channels=4 * hidden_dim,
                               kernel_size=kernel_size,
                               padding=padding,
@@ -88,16 +84,8 @@ class ConvLSTM1DCell(nn.Module):
 
     def forward(self, input_tensor, cur_state):
         h_cur, c_cur = cur_state
-        
-        # input_tensor: (Batch, Channel=3, Length=21)
-        # h_cur: (Batch, Hidden, Length=21)
-        
-        # 채널 방향(dim=1)으로 결합
-        combined = torch.cat([input_tensor, h_cur], dim=1)
-        
+        combined = torch.cat([input_tensor, h_cur], dim=1)  # Channel 방향 결합
         combined_conv = self.conv(combined)
-        
-        # 4개 게이트로 분할
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
 
         i = torch.sigmoid(cc_i)
@@ -110,70 +98,68 @@ class ConvLSTM1DCell(nn.Module):
 
         return h_next, c_next
 
-    def init_hidden(self, batch_size, seq_len):
-        # seq_len은 여기서 '관절의 개수(21)'를 의미함
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
         device = self.conv.weight.device
-        return (torch.zeros(batch_size, self.hidden_dim, seq_len, device=device),
-                torch.zeros(batch_size, self.hidden_dim, seq_len, device=device))
-
+        return (torch.zeros(batch_size, self.hidden_dim, height, width, device=device),
+                torch.zeros(batch_size, self.hidden_dim, height, width, device=device))
 
 # ==========================================
-# 2. 메인 모델
+# 2. 메인 모델: SensorConvLSTM (2D 버전)
 # ==========================================
 class SensorConvLSTM(nn.Module):
-    def __init__(self, num_sensors=21, hidden_dim=64, kernel_size=3, num_classes=7):
+    def __init__(self, num_sensors=21, hidden_dim=64, kernel_size=(1, 3), num_classes=7):
         super(SensorConvLSTM, self).__init__()
         
-        self.num_sensors = num_sensors # 21
-        self.input_channels = 3        # x, y, z
+        self.num_sensors = num_sensors
+        self.input_channels = 3 # x, y, z 좌표를 RGB 채널처럼 사용
+        self.hidden_dim = hidden_dim
         
-        self.conv_lstm1d = ConvLSTM1DCell(input_dim=self.input_channels,
-                                          hidden_dim=hidden_dim,
-                                          kernel_size=kernel_size)
+        self.conv_lstm = ConvLSTMCell(input_dim=self.input_channels, 
+                                      hidden_dim=hidden_dim, 
+                                      kernel_size=kernel_size)
         
-        self.dropout = nn.Dropout(0.5)
+        self.dropout = nn.Dropout(0.3)
         
-        # 분류기
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(64, num_classes)
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, num_classes)
         )
 
     def forward(self, x):
-        # 입력 x: (Batch, Time, Features=63)
+        # x shape: (Batch, Time, Features=63)
         b, t, f = x.size()
         
-        # 1. 데이터 Reshape
+        # 1. Reshape & Permute (이미지 형태로 변환)
         # (Batch, Time, 63) -> (Batch, Time, 21, 3)
         x = x.view(b, t, self.num_sensors, 3)
         
-        # Conv1d는 (Batch, Channel, Length)를 받으므로 Permute 필요
-        # (Batch, Time, 3, 21) 형태로 변경
-        x = x.permute(0, 1, 3, 2) 
+        # (Batch, Time, 3, 21) -> Channel=3, Height=1, Width=21
+        x = x.permute(0, 1, 3, 2).unsqueeze(3) # (Batch, Time, 3, 1, 21)
         
-        # 초기 상태 (Hidden State) 초기화
-        # h: (Batch, Hidden, 21)
-        h, c = self.conv_lstm1d.init_hidden(b, self.num_sensors)
+        # 초기 상태
+        h, c = self.conv_lstm.init_hidden(b, (1, self.num_sensors))
         
-        # 2. 시간(Time) 루프
+        # 2. 시퀀스 연산
         for step in range(t):
-            current_input = x[:, step, :, :] # (Batch, 3, 21)
-            h, c = self.conv_lstm1d(current_input, (h, c))
+            current_input = x[:, step, :, :, :] # (Batch, 3, 1, 21)
+            h, c = self.conv_lstm(current_input, (h, c))
         
-        # 루프가 끝나면 h는 마지막 시점의 공간적 특징을 담고 있음
-        # h shape: (Batch, Hidden, 21)
-        
-        # 3. Global Average Pooling
-        # 21개 관절에 퍼져있는 특징을 평균내어 하나로 압축
-        feature_vector = torch.mean(h, dim=2) # (Batch, Hidden)
+        # 3. Feature Aggregation
+        # h: (Batch, Hidden, 1, 21)
+        # 관절(Width) 차원을 평균내어 특징 압축
+        feature_vector = torch.mean(h, dim=3).squeeze(2) # (Batch, Hidden)
         
         feature_vector = self.dropout(feature_vector)
         output = self.classifier(feature_vector)
         
         return output
-    
+      
 class BadmintonDataset(Dataset):
     def __init__(self, data_list, labels):
         self.data = data_list
