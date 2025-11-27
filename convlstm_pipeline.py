@@ -64,136 +64,116 @@ def setup_dataset(processed_data_folder):
     
     return dataset
 
-class ConvLSTMCell(nn.Module):
+class ConvLSTM1DCell(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
         """
-        초기화 함수
-        :param input_dim: 입력 이미지의 채널 수 (예: Radar map 채널)
-        :param hidden_dim: 은닉 상태(Hidden State)의 채널 수
-        :param kernel_size: 커널 크기 (예: (3,3) 또는 3)
-        :param bias: 바이어스 사용 여부
+        input_dim: 입력 채널 수 (x,y,z 니까 3)
+        hidden_dim: 은닉 상태 채널 수
+        kernel_size: 커널 크기 (예: 3 -> 인접한 3개 관절을 묶어서 봄)
         """
-        super(ConvLSTMCell, self).__init__()
-
+        super(ConvLSTM1DCell, self).__init__()
+        
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-
-        # 커널의 높이와 너비가 홀수여야 패딩을 통해 입력 크기를 유지하기 쉽습니다.
-        # 논문에서는 상태(State)의 크기가 입력과 동일하게 유지되도록 패딩을 사용한다고 명시되어 있습니다[cite: 107].
-        padding = kernel_size[0] // 2, kernel_size[1] //2
-
-        # 합성곱 연산 정의 (Input + Hidden 상태를 채널 방향으로 합쳐서 연산)
-        # 출력 채널은 4 * hidden_dim (Input gate, Forget gate, Cell gate, Output gate)
-        self.conv = nn.Conv2d(in_channels=input_dim + hidden_dim,
+        
+        # 패딩을 (kernel_size // 2)로 주면 입력 길이(관절 수)가 유지됨
+        padding = kernel_size // 2
+        
+        # Conv1d 사용! (In + Hidden 채널을 합쳐서 연산)
+        self.conv = nn.Conv1d(in_channels=input_dim + hidden_dim,
                               out_channels=4 * hidden_dim,
                               kernel_size=kernel_size,
                               padding=padding,
                               bias=bias)
 
     def forward(self, input_tensor, cur_state):
-        """
-        Forward Pass
-        :param input_tensor: (Batch, Input_Channel, Height, Width) - 4D 텐서 [cite: 96]
-        :param cur_state: 튜플 (h_cur, c_cur) - 이전 시점의 은닉 상태와 셀 상태
-        """
         h_cur, c_cur = cur_state
-
-        # 1. 입력(Xt)과 이전 은닉 상태(Ht-1)를 채널 차원(dim=1)으로 결합 (Concatenate)
-        # 논문의 수식에서 W_xi * X + W_hi * H 부분을 효율적으로 처리하는 방식입니다.
+        
+        # input_tensor: (Batch, Channel=3, Length=21)
+        # h_cur: (Batch, Hidden, Length=21)
+        
+        # 채널 방향(dim=1)으로 결합
         combined = torch.cat([input_tensor, h_cur], dim=1)
-
-        # 2. 합성곱 연산 수행
+        
         combined_conv = self.conv(combined)
-
-        # 3. 결과 텐서를 4개의 게이트로 분할 (cc_i, cc_f, cc_o, cc_g)
+        
+        # 4개 게이트로 분할
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
 
-        # 4. 활성화 함수 적용 (논문의 수식 (3) 참조 )
-        i = torch.sigmoid(cc_i) # Input Gate
-        f = torch.sigmoid(cc_f) # Forget Gate
-        o = torch.sigmoid(cc_o) # Output Gate
-        g = torch.tanh(cc_g)    # Cell Input (Input modulation)
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
 
-        # 5. 셀 상태 업데이트 (C_t)
-        # 논문 수식: C_t = f_t * C_{t-1} + i_t * tanh(...)
-        # * 연산은 요소별 곱(Hadamard Product)입니다.
         c_next = f * c_cur + i * g
-
-        # 6. 은닉 상태 업데이트 (H_t)
-        # 논문 수식: H_t = o_t * tanh(C_t)
         h_next = o * torch.tanh(c_next)
 
         return h_next, c_next
 
-    def init_hidden(self, batch_size, image_size):
-        """
-        초기 상태(0) 생성 함수
-        논문에서는 초기 상태를 0으로 설정하는 것이 '미래에 대한 완전한 무지'를 의미한다고 설명합니다[cite: 109].
-        """
-        height, width = image_size
-        return (torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device),
-                torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device))
+    def init_hidden(self, batch_size, seq_len):
+        # seq_len은 여기서 '관절의 개수(21)'를 의미함
+        device = self.conv.weight.device
+        return (torch.zeros(batch_size, self.hidden_dim, seq_len, device=device),
+                torch.zeros(batch_size, self.hidden_dim, seq_len, device=device))
 
+
+# ==========================================
+# 2. 메인 모델
+# ==========================================
 class SensorConvLSTM(nn.Module):
-    def __init__(self, num_sensors, hidden_dim=64, kernel_size=3, num_classes=10):
-        """
-        :param num_sensors: 입력 데이터의 센서(Joint) 개수 (동적으로 받음)
-        :param hidden_dim: ConvLSTM 내부의 은닉 상태 채널 수
-        :param kernel_size: 커널 크기
-        :param num_classes: 분류할 클래스 개수
-        """
+    def __init__(self, num_sensors=21, hidden_dim=64, kernel_size=3, num_classes=7):
         super(SensorConvLSTM, self).__init__()
         
-        self.num_sensors = num_sensors  # 동적으로 설정됨
-        self.input_channels = 3 # x, y, z (Input Depth)
-        self.hidden_dim = hidden_dim
+        self.num_sensors = num_sensors # 21
+        self.input_channels = 3        # x, y, z
         
-        # 1. ConvLSTM Cell 초기화
-        # 높이가 1이므로 커널의 높이도 1로 고정 (1, kernel_size)
-        # 패딩을 적절히 주어 센서 개수(W)가 유지되도록 함
-        padding = (0, kernel_size // 2) 
-        self.conv_lstm = ConvLSTMCell(input_dim=self.input_channels, 
-                                      hidden_dim=hidden_dim, 
-                                      kernel_size=(1, kernel_size))
+        self.conv_lstm1d = ConvLSTM1DCell(input_dim=self.input_channels,
+                                          hidden_dim=hidden_dim,
+                                          kernel_size=kernel_size)
         
-        # 2. 분류기 (Classifier)
-        # Global Average Pooling 후 입력되므로 input_dim = hidden_dim
+        self.dropout = nn.Dropout(0.5)
+        
+        # 분류기
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
+            nn.Dropout(0.5),
             nn.Linear(64, num_classes)
         )
 
     def forward(self, x):
-        """
-        :param x: (Batch, Time, Features) - Flatten된 입력
-        """
-        b, t, d = x.size()
+        # 입력 x: (Batch, Time, Features=63)
+        b, t, f = x.size()
         
-        # [Step 1] 데이터 Reshape: (Batch, Time, Features) -> (Batch, Time, Num_Sensors, 3)
-        # Features = Num_Sensors * 3
-        x = x.view(b, t, self.num_sensors, self.input_channels)
+        # 1. 데이터 Reshape
+        # (Batch, Time, 63) -> (Batch, Time, 21, 3)
+        x = x.view(b, t, self.num_sensors, 3)
         
-        # [Step 2] Permute: (Batch, Time, Num_Sensors, 3) -> (Batch, Time, 3, 1, Num_Sensors)
-        x = x.permute(0, 1, 3, 2).unsqueeze(3)
+        # Conv1d는 (Batch, Channel, Length)를 받으므로 Permute 필요
+        # (Batch, Time, 3, 21) 형태로 변경
+        x = x.permute(0, 1, 3, 2) 
         
-        # 초기 상태 초기화 (H=1, W=Num_Sensors)
-        h, c = self.conv_lstm.init_hidden(b, (1, self.num_sensors))
+        # 초기 상태 (Hidden State) 초기화
+        # h: (Batch, Hidden, 21)
+        h, c = self.conv_lstm1d.init_hidden(b, self.num_sensors)
         
-        # [Step 3] 시퀀스 처리 (Time loop)
+        # 2. 시간(Time) 루프
         for step in range(t):
-            current_input = x[:, step, :, :, :]
-            h, c = self.conv_lstm(current_input, (h, c))
+            current_input = x[:, step, :, :] # (Batch, 3, 21)
+            h, c = self.conv_lstm1d(current_input, (h, c))
         
-        # [Step 4] Feature Aggregation
-        # dim=3(Width=Num_Sensors) 방향으로 평균
-        feature_vector = torch.mean(h, dim=3).squeeze(2) 
+        # 루프가 끝나면 h는 마지막 시점의 공간적 특징을 담고 있음
+        # h shape: (Batch, Hidden, 21)
         
-        # [Step 5] 최종 분류
+        # 3. Global Average Pooling
+        # 21개 관절에 퍼져있는 특징을 평균내어 하나로 압축
+        feature_vector = torch.mean(h, dim=2) # (Batch, Hidden)
+        
+        feature_vector = self.dropout(feature_vector)
         output = self.classifier(feature_vector)
         
         return output
-
+    
 class BadmintonDataset(Dataset):
     def __init__(self, data_list, labels):
         self.data = data_list
@@ -391,7 +371,7 @@ def main():
     for stroke_type, joint_type, body_part in experiments:
         try:
             run_kfold_experiment(dataset=dataset,stroke_type=stroke_type,joint_type=joint_type,body_part=body_part,k=5,device=device,output_dir=output_dir,
-                epoch=50,batch_size=64, hidden_dim=32, kernel_size=3, num_classes=7)
+                epoch=1,batch_size=64, hidden_dim=32, kernel_size=3, num_classes=7)
             
         except Exception as e:
             print(f"\nERROR in experiment {stroke_type}_{joint_type}_{body_part}: {e}")
